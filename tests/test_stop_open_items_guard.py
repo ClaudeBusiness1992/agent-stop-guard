@@ -85,6 +85,12 @@ class MarkerTests(unittest.TestCase):
             "wiederhole danach die visuelle Prüfung."
         )
 
+    def test_trennbare_schau_mir_an_ankuendigung_wird_erkannt(self):
+        self.assert_blocked_text(
+            "Ich schaue mir jetzt gezielt Herdr selbst an: ob die Chat- und "
+            "Werkzeugkarten kompakter dargestellt werden können."
+        )
+
     def test_ich_mache_weiter_wird_erkannt(self):
         self.assert_blocked_text(
             "Ich mache weiter mit dem vorgesehenen Onboarding für den Swipe-Tab."
@@ -342,6 +348,26 @@ class ToolActivityTests(unittest.TestCase):
             "stop_hook_active": False,
         })
         self.assertEqual(json.loads(output)["decision"], "block")
+
+    def test_trennbare_ankuendigung_blockiert_auch_ohne_werkzeuglauf(self):
+        session_id = "unit-separable-promise-no-tool"
+        self.addCleanup(GUARD.clear_audit_pending, session_id)
+        GUARD.clear_audit_pending(session_id)
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Ich schaue mir jetzt gezielt Herdr selbst an: ob die Chat- und "
+                "Werkzeugkarten kompakter dargestellt werden können."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(json.loads(output)["decision"], "block")
+        self.assertTrue(GUARD.audit_pending(session_id))
 
     def test_ankuendigung_ohne_werkzeug_laesst_audit_offen(self):
         session_id = "unit-no-tool-latch"

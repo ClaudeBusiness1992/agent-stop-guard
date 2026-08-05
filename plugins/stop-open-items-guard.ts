@@ -31,6 +31,7 @@ const MARKERS = new RegExp(
     // passieren: Eine Ankündigung wie "ich schaue kurz nach" ist noch
     // keine ausgeführte Arbeit.
     "ich (schaue|gucke|prüfe|pruefe|checke|teste) (kurz|mal|gleich|jetzt|mir das|nach)",
+    "ich (schaue|gucke|prüfe|pruefe|checke|teste) mir (?:(jetzt|gleich|nun|direkt|kurz|mal)\\s+)?[^\\n.!?]{0,120}\\b(an|nach)\\b",
     "ich (arbeite|mache) (jetzt|gleich|direkt|nun|sofort) .{0,60}weiter",
     "ich (beginne|starte|fange|lege) (jetzt|gleich|nun|direkt|sofort)",
     "ich setze .{0,40}fort",

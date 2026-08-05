@@ -54,6 +54,10 @@ WORK_PROMISE_MARKERS = re.compile(
     # (Lücke vom 31.07.: Session endete mit "Ich schaue kurz nach" /
     # "Ich arbeite jetzt an X weiter" und stoppte trotzdem)
     r"|ich (schaue|gucke|pr[üu]fe|checke|teste) (kurz|mal|gleich|jetzt|mir das|nach)"
+    # Auch trennbare Konstruktionen wie "Ich schaue mir jetzt gezielt X an"
+    # sind unmittelbare Arbeitsversprechen und dürfen nicht idle enden.
+    r"|ich (?:schaue|gucke|pr[üu]fe|checke|teste) mir "
+    r"(?:(?:jetzt|gleich|nun|direkt|kurz|mal)\s+)?[^\n.!?]{0,120}\b(?:an|nach)\b"
     r"|ich (arbeite|mache) (jetzt|gleich|direkt|nun|sofort) .{0,60}weiter"
     r"|ich (?:mache|arbeite) weiter\b"
     r"|ich arbeite .{0,80}\bjetzt ab\b"
