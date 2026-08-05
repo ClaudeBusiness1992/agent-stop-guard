@@ -14,16 +14,18 @@ agent to continue within the already authorized scope.
 - pending or in-progress Codex `update_plan` items;
 - a Codex turn ending on a commentary/intermediate message;
 - explicit promises such as “I will check that now” without execution;
-- work turns with tool activity that have not performed a final scope audit;
+- provider-native pending or in-progress tasks where the platform exposes them;
 - a claimed completion that contradicts text saying work remains.
 
-The guard accepts these explicit final attestations:
+The guard recognizes these explicit final attestations where a structured
+task is deliberately parked:
 
 ```text
 AUFTRAG VOLLSTÄNDIG ERLEDIGT
 ```
 
-or, when only the user can unblock the remaining work:
+or, when only the user can unblock the remaining work. A generic placeholder
+such as “later” is rejected; the line must name concrete required input:
 
 ```text
 BLOCKED_ON_USER: <specific required input and evidence>
@@ -67,8 +69,11 @@ python3 install.py --claude --ask-user-guard
 The installer:
 
 - stores shared scripts under `~/.local/share/agent-stop-guard/`;
+- keeps an identical Claude compatibility copy for already-running sessions
+  that cached the former direct hook path;
 - merges hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`;
 - installs the OpenCode plugin under `~/.config/opencode/plugins/`;
+- migrates an older direct Claude/Codex hook path to the shared installed copy;
 - creates timestamped backups before changing an existing JSON file;
 - never copies credentials, provider settings or unrelated configuration.
 
@@ -108,10 +113,10 @@ rejections to avoid deadlocks.
 ## OpenCode behavior
 
 OpenCode exposes an idle event rather than the same transcript-oriented Stop
-hook. Its plugin therefore provides a lighter guard: it reads the latest
-assistant message on `session.idle` and injects a continuation prompt when it
-contains a clear unfinished-work marker. It does not claim parity with the
-Claude/Codex structured task audit.
+hook. Its plugin reads the latest assistant message and the native session Todo
+list on `session.idle`. It applies the same scope-safe threshold as Claude and
+Codex: actionable structured work and concrete first-person work promises
+continue; optional recommendations and tool use by themselves do not.
 
 ## Not included
 

@@ -118,6 +118,19 @@ class MarkerTests(unittest.TestCase):
 
 
 class ToolActivityTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runtime_state.cleanup)
+        self.previous_state_root = GUARD.STATE_ROOT
+        self.previous_log_path = GUARD.LOG_PATH
+        self.previous_kill_switch = GUARD.KILL_SWITCH
+        GUARD.STATE_ROOT = self.runtime_state.name
+        GUARD.LOG_PATH = str(pathlib.Path(self.runtime_state.name, "guard.log"))
+        GUARD.KILL_SWITCH = str(pathlib.Path(self.runtime_state.name, "disabled"))
+        self.addCleanup(setattr, GUARD, "STATE_ROOT", self.previous_state_root)
+        self.addCleanup(setattr, GUARD, "LOG_PATH", self.previous_log_path)
+        self.addCleanup(setattr, GUARD, "KILL_SWITCH", self.previous_kill_switch)
+
     def write_transcript(self, entries):
         handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
         with handle:
@@ -226,7 +239,7 @@ class ToolActivityTests(unittest.TestCase):
                 GUARD.main()
         return stdout.getvalue().strip()
 
-    def test_erster_arbeitsabschluss_setzt_audit_sperre(self):
+    def test_werkzeugabschluss_braucht_keinen_zweitaudit(self):
         session_id = "unit-first-stop-latch"
         self.addCleanup(GUARD.clear_audit_pending, session_id)
         GUARD.clear_audit_pending(session_id)
@@ -240,10 +253,10 @@ class ToolActivityTests(unittest.TestCase):
             "last_assistant_message": "Alles umgesetzt.",
             "stop_hook_active": False,
         })
-        self.assertEqual(json.loads(output)["decision"], "block")
-        self.assertTrue(GUARD.audit_pending(session_id))
+        self.assertEqual(output, "")
+        self.assertFalse(GUARD.audit_pending(session_id))
 
-    def test_arbeitsversprechen_kann_nicht_mit_offenliste_durchrutschen(self):
+    def test_arbeitsversprechen_blockiert_nur_das_echte_versprechen(self):
         session_id = "unit-promise-latches-audit"
         self.addCleanup(GUARD.clear_audit_pending, session_id)
         GUARD.clear_audit_pending(session_id)
@@ -272,8 +285,8 @@ class ToolActivityTests(unittest.TestCase):
             ),
             "stop_hook_active": True,
         })
-        self.assertEqual(json.loads(second)["decision"], "block")
-        self.assertTrue(GUARD.audit_pending(session_id))
+        self.assertEqual(second, "")
+        self.assertFalse(GUARD.audit_pending(session_id))
 
     def test_erster_belegter_arbeitsabschluss_braucht_keinen_zweitaudit(self):
         session_id = "unit-attested-first-stop"
@@ -369,7 +382,7 @@ class ToolActivityTests(unittest.TestCase):
         self.assertEqual(json.loads(output)["decision"], "block")
         self.assertTrue(GUARD.audit_pending(session_id))
 
-    def test_ankuendigung_ohne_werkzeug_laesst_audit_offen(self):
+    def test_fertiger_text_ohne_werkzeug_loescht_audit_altlast(self):
         session_id = "unit-no-tool-latch"
         self.addCleanup(GUARD.clear_audit_pending, session_id)
         GUARD.set_audit_pending(session_id)
@@ -383,8 +396,8 @@ class ToolActivityTests(unittest.TestCase):
             "last_assistant_message": "Alles umgesetzt.",
             "stop_hook_active": True,
         })
-        self.assertEqual(json.loads(output)["decision"], "block")
-        self.assertTrue(GUARD.audit_pending(session_id))
+        self.assertEqual(output, "")
+        self.assertFalse(GUARD.audit_pending(session_id))
 
     def test_werkzeuglauf_erfuellt_offenen_audit(self):
         session_id = "unit-tool-satisfies-latch"
@@ -406,7 +419,7 @@ class ToolActivityTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertFalse(GUARD.audit_pending(session_id))
 
-    def test_werkzeuglauf_ohne_attestierung_bleibt_blockiert(self):
+    def test_werkzeuglauf_braucht_keine_formale_attestierung(self):
         session_id = "unit-missing-attestation"
         self.addCleanup(GUARD.clear_audit_pending, session_id)
         GUARD.set_audit_pending(session_id)
@@ -420,8 +433,8 @@ class ToolActivityTests(unittest.TestCase):
             "last_assistant_message": "Alles umgesetzt und verifiziert.",
             "stop_hook_active": True,
         })
-        self.assertEqual(json.loads(output)["decision"], "block")
-        self.assertTrue(GUARD.audit_pending(session_id))
+        self.assertEqual(output, "")
+        self.assertFalse(GUARD.audit_pending(session_id))
 
     def test_blocked_on_user_verdeckt_keinen_lokalen_codex_planpunkt(self):
         session_id = "unit-partial-blocker-plan"
@@ -488,6 +501,66 @@ class ToolActivityTests(unittest.TestCase):
             GUARD.has_completion_attestation("Ergebnis.\nAUFTRAG VOLLSTÄNDIG ERLEDIGT")
         )
         self.assertFalse(GUARD.has_completion_attestation("BLOCKED_ON_USER:"))
+        self.assertFalse(
+            GUARD.has_completion_attestation("BLOCKED_ON_USER: später")
+        )
+        self.assertTrue(
+            GUARD.has_completion_attestation(
+                "BLOCKED_ON_USER: API-Schlüssel fehlt; HTTP 401 belegt das Gate."
+            )
+        )
+
+    def test_unspezifischer_blocker_parkt_weder_task_noch_plan(self):
+        self.assertFalse(
+            GUARD.task_blocked_on_user({
+                "status": "pending",
+                "description": "BLOCKED_ON_USER: später",
+            })
+        )
+        self.assertFalse(
+            GUARD.plan_item_blocked_on_user({
+                "status": "pending",
+                "step": "BLOCKED_ON_USER: unbekannt",
+            })
+        )
+
+    def test_stop_guard_bericht_ist_keine_ausnahme_fuer_echte_ankuendigung(self):
+        session_id = "unit-no-guard-report-bypass"
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Beim Stop-Guard: Ich mache jetzt mit der Reparatur weiter."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(json.loads(output)["decision"], "block")
+
+    def test_nackter_expo_viewport_ist_kein_iphone_rahmen(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call",
+                "input": "npx expo start; chromium --screenshot --window-size=393,852 App.tsx",
+            }},
+        ])
+        self.assertEqual(GUARD.mobile_ui_frame_state(path), (True, False))
+
+    def test_vollstaendiger_iphone_rahmen_wird_erkannt(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call",
+                "input": (
+                    "Expo App.tsx Screenshot mit DeviceFrame iPhone-15-Pro-Geräterahmen, "
+                    "Dynamic Island und iOS-Statusleiste"
+                ),
+            }},
+        ])
+        self.assertEqual(GUARD.mobile_ui_frame_state(path), (True, True))
 
 
 if __name__ == "__main__":

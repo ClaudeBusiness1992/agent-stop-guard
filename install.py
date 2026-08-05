@@ -33,6 +33,23 @@ def contains_command(value: object, marker: str) -> bool:
     return isinstance(value, str) and marker in value
 
 
+def replace_hook_command(value: object, script_name: str, command: str) -> bool:
+    """Migriert nur den verwalteten Hook, ohne andere Hooks anzufassen."""
+    changed = False
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "command" and isinstance(item, str) and script_name in item:
+                if item != command:
+                    value[key] = command
+                    changed = True
+                continue
+            changed = replace_hook_command(item, script_name, command) or changed
+    elif isinstance(value, list):
+        for item in value:
+            changed = replace_hook_command(item, script_name, command) or changed
+    return changed
+
+
 def append_hook(
     config: dict,
     event: str,
@@ -111,6 +128,12 @@ def install(
     if platforms & {"claude", "codex"}:
         copy_file(stop_source, stop_target, 0o755, dry_run=dry_run)
         actions.append(f"install {stop_target}")
+        # Bereits laufende ältere Sessions können den direkten Hookpfad beim
+        # Start gecacht haben. Die identische Kompatibilitätskopie verhindert,
+        # dass sie bis zum Neustart noch die alte Policy ausführen.
+        legacy_stop_target = home / ".claude" / "hooks" / stop_source.name
+        copy_file(stop_source, legacy_stop_target, 0o755, dry_run=dry_run)
+        actions.append(f"install compatibility copy {legacy_stop_target}")
     if include_ask_user_guard and "claude" in platforms:
         copy_file(ask_source, ask_target, 0o755, dry_run=dry_run)
         actions.append(f"install {ask_target}")
@@ -119,7 +142,10 @@ def install(
     if "claude" in platforms:
         path = home / ".claude" / "settings.json"
         config = read_json(path)
-        changed = append_hook(config, "Stop", stop_command)
+        changed = replace_hook_command(
+            config, stop_source.name, stop_command
+        )
+        changed = append_hook(config, "Stop", stop_command) or changed
         if include_ask_user_guard:
             ask_command = f"python3 {shlex.quote(str(ask_target))}"
             changed = append_hook(
@@ -135,7 +161,11 @@ def install(
     if "codex" in platforms:
         path = home / ".codex" / "hooks.json"
         config = read_json(path)
-        if append_hook(config, "Stop", stop_command):
+        changed = replace_hook_command(
+            config, stop_source.name, stop_command
+        )
+        changed = append_hook(config, "Stop", stop_command) or changed
+        if changed:
             write_json_with_backup(path, config, dry_run=dry_run)
             actions.append(f"merge {path}")
 

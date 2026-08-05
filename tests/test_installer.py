@@ -44,6 +44,33 @@ class InstallerTests(unittest.TestCase):
             (self.home / ".config" / "opencode" / "plugins" / "stop-open-items-guard.ts").is_file()
         )
 
+    def test_legacy_direct_hook_is_migrated_without_duplicate(self):
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps({
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "python3 '/tmp/legacy/stop-open-items-guard.py'",
+                        }]
+                    }]
+                }
+            }),
+            encoding="utf-8",
+        )
+        INSTALLER.install({"claude"}, home=self.home)
+        result = json.loads(settings.read_text(encoding="utf-8"))
+        serialized = json.dumps(result)
+        self.assertNotIn("/tmp/legacy", serialized)
+        self.assertEqual(serialized.count("stop-open-items-guard.py"), 1)
+        self.assertIn(".local/share/agent-stop-guard", serialized)
+        self.assertEqual(
+            (self.home / ".claude" / "hooks" / "stop-open-items-guard.py").read_bytes(),
+            (self.home / ".local" / "share" / "agent-stop-guard" / "stop-open-items-guard.py").read_bytes(),
+        )
+
     def test_dry_run_does_not_write(self):
         actions = INSTALLER.install({"claude"}, dry_run=True, home=self.home)
         self.assertTrue(actions)

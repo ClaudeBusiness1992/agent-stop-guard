@@ -60,7 +60,7 @@ WORK_PROMISE_MARKERS = re.compile(
     r"(?:(?:jetzt|gleich|nun|direkt|kurz|mal)\s+)?[^\n.!?]{0,120}\b(?:an|nach)\b"
     r"|ich (arbeite|mache) (jetzt|gleich|direkt|nun|sofort) .{0,60}weiter"
     r"|ich (?:mache|arbeite) weiter\b"
-    r"|ich arbeite .{0,80}\bjetzt ab\b"
+    r"|ich arbeite .{0,80}\bjetzt\b.{0,40}\bab\b"
     r"|ich (?:repariere|behebe|korrigiere|ersetze|wiederhole|pr[üu]fe|teste) "
     r"(?:zuerst|jetzt|gleich|direkt|nun|als n[äa]chstes)"
     r"|ich (beginne|starte|fange|lege) (jetzt|gleich|nun|direkt|sofort)"
@@ -109,14 +109,32 @@ def has_local_unfinished_marker(text):
     return LOCAL_UNFINISHED_MARKERS.search(without_examples) is not None
 
 
-COMPLETION_ATTESTATION = re.compile(
-    r"(?:^|\n)\s*(?:AUFTRAG VOLLSTÄNDIG ERLEDIGT|BLOCKED_ON_USER:\s*\S)",
+BLOCKED_ATTESTATION_LINE = re.compile(
+    r"(?:^|\n)\s*BLOCKED_ON_USER:\s*(?P<detail>[^\n]*)", re.IGNORECASE
+)
+NON_SPECIFIC_BLOCKERS = re.compile(
+    r"^(?:sp[aä]ter|unbekannt|unklar|offen|todo|tbd|n/?a|keine ahnung|wartet)"
+    r"[.!\s]*$",
     re.IGNORECASE,
 )
 
 
+def blocked_on_user_detail(text):
+    """Liefert nur einen konkreten, nicht bloß behaupteten Nutzerblocker."""
+    match = BLOCKED_ATTESTATION_LINE.search(text)
+    if not match:
+        return None
+    detail = match.group("detail").strip()
+    if len(detail) < 12 or NON_SPECIFIC_BLOCKERS.fullmatch(detail):
+        return None
+    return detail
+
+
 def has_completion_attestation(text):
-    return COMPLETION_ATTESTATION.search(text) is not None
+    return (
+        has_full_completion_attestation(text)
+        or blocked_on_user_detail(text) is not None
+    )
 
 
 FULL_COMPLETION_ATTESTATION = re.compile(
@@ -129,13 +147,8 @@ def has_full_completion_attestation(text):
     return FULL_COMPLETION_ATTESTATION.search(text) is not None
 
 
-BLOCKED_ATTESTATION = re.compile(
-    r"(?:^|\n)\s*BLOCKED_ON_USER:\s*\S", re.IGNORECASE
-)
-
-
 def has_blocked_attestation(text):
-    return BLOCKED_ATTESTATION.search(text) is not None
+    return blocked_on_user_detail(text) is not None
 
 
 def last_assistant_text(transcript_path):
@@ -314,16 +327,95 @@ def task_blocked_on_user(task):
     if task.get("status") != "pending":
         return False
     description = str(task.get("description") or "")
-    return re.search(r"(?:^|\n)\s*BLOCKED_ON_USER:\s*\S", description, re.I) is not None
+    return blocked_on_user_detail(description) is not None
 
 
 def plan_item_blocked_on_user(item):
     """Codex hat kein description-Feld; der Blocker steht daher im Step."""
     return (
         item.get("status") == "pending"
-        and re.match(r"\s*BLOCKED_ON_USER:\s*\S", str(item.get("step") or ""), re.I)
-        is not None
+        and blocked_on_user_detail(str(item.get("step") or "")) is not None
     )
+
+
+def mobile_ui_frame_state(transcript_path, assistant_text=""):
+    """Erkennt Mobile-UI-Prüfungen und den geforderten Vollrahmen-Nachweis."""
+    has_tool_activity = False
+    platform_signal = False
+    visual_signal = False
+    frame_text = assistant_text.lower()
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if _is_real_user_message(entry):
+                    has_tool_activity = False
+                    platform_signal = False
+                    visual_signal = False
+                    frame_text = assistant_text.lower()
+                    continue
+                raw = json.dumps(entry, ensure_ascii=False).lower()
+                if _is_tool_activity(entry):
+                    has_tool_activity = True
+                    guard_maintenance = any(
+                        token in raw
+                        for token in (
+                            "agent-stop-guard/",
+                            "stop-open-items-guard.py",
+                            "test_stop_open_items_guard.py",
+                        )
+                    )
+                    if guard_maintenance:
+                        continue
+                    if any(
+                        token in raw
+                        for token in (
+                            "npx expo",
+                            "expo start",
+                            "expo export",
+                            "react-native",
+                            "app.tsx",
+                        )
+                    ):
+                        platform_signal = True
+                    if any(
+                        token in raw
+                        for token in (
+                            "screenshot",
+                            "playwright",
+                            "chromium",
+                            "browser",
+                            "vorschau",
+                            "preview",
+                            "view_image",
+                        )
+                    ):
+                        visual_signal = True
+                    frame_text += "\n" + raw
+                elif entry.get("type") in ("event_msg", "response_item"):
+                    payload = entry.get("payload") or {}
+                    if payload.get("type") in ("agent_message", "message"):
+                        frame_text += "\n" + raw
+    except OSError:
+        return False, False
+
+    mobile_ui_work = has_tool_activity and platform_signal and visual_signal
+    device = "iphone-15-pro" in frame_text or "iphone 15 pro" in frame_text
+    frame = any(
+        token in frame_text
+        for token in (
+            "geräterahmen",
+            "geraeterahmen",
+            "deviceframe",
+            "device frame",
+        )
+    )
+    island = "dynamic island" in frame_text
+    status = "statusleiste" in frame_text or "status bar" in frame_text
+    return mobile_ui_work, device and frame and island and status
 
 
 def last_assistant_phase(transcript_path):
@@ -487,7 +579,6 @@ def main():
     text = text or ""
 
     transcript_path = payload.get("transcript_path")
-    attested = has_completion_attestation(text)
     blocked_attested = has_blocked_attestation(text)
 
     # Eine Commentary-Nachricht ist per Definition ein Zwischenstand. Codex
@@ -505,9 +596,6 @@ def main():
         print(json.dumps({"decision": "block", "reason": reason}))
         log(session_id, "blockiert(commentary)", "Turn endete auf Commentary-Phase")
         return
-
-    # Berichte ÜBER den Guard selbst (zitieren die Marker-Phrasen) nicht blocken
-    guard_report = "stop-guard" in text.lower()
 
     # 1. Harte Regel: offene Tasks. Zählt unabhängig vom Antworttext und
     #    bekommt ein großes Budget - solange Arbeit offen ist, wird gearbeitet.
@@ -604,7 +692,7 @@ def main():
             )
         )
     )
-    if text_requires_continuation and not guard_report:
+    if text_requires_continuation:
         # Eine blockierte Arbeitsankündigung muss zugleich die harte
         # Audit-Sperre setzen. Andernfalls kann der automatisch fortgesetzte
         # Stopversuch (`stop_hook_active=true`) mit einer bloßen Aufzählung
@@ -626,82 +714,34 @@ def main():
         if block(session_id, reason, "Ankündigungsmuster im Text", MAX_BLOCKS):
             return
 
-    # 3. Abschlussaudit für echte Arbeits-Turns. Worterkennung allein lässt
-    #    sich durch einen glatt formulierten Teilabschluss umgehen. Sobald in
-    #    diesem Nutzerdurchgang Werkzeuge liefen, verweigern Claude und Codex
-    #    deshalb einen Audit, wenn noch keine strukturierte, selbst geprüfte
-    #    Abschlusszeile vorliegt. Eine bereits attestierte Antwort wird nicht
-    #    zu einem zweiten identischen Werkzeug-/Auditdurchgang gezwungen.
-    has_tool_activity = bool(
-        transcript_path and turn_has_tool_activity(transcript_path)
+    # 3. Spezifische UI-Sicherheitsregel. Allgemeine Werkzeugnutzung erzwingt
+    # bewusst keinen zweiten Audit-Turn und keine formale Abschlussphrase.
+    mobile_ui_work, has_full_device_frame = (
+        mobile_ui_frame_state(transcript_path, text)
+        if transcript_path
+        else (False, False)
     )
-    pending_audit = audit_pending(session_id)
+    if mobile_ui_work and not has_full_device_frame:
+        reason = (
+            "MOBILE-UI-PRÜFUNG UNGÜLTIG: Ein nackter 393×852-Viewport oder "
+            "ein entsprechend großes Chromium-Screenshot ist kein iPhone-Nachweis. "
+            "Stelle die Expo-/iOS-App in einem vollständigen realistischen "
+            "iPhone-15-Pro-Geräterahmen dar: Die App selbst bleibt exakt 393×852 "
+            "CSS-Pixel groß; außen herum müssen sichtbares Gehäuse, abgerundete "
+            "Displaykanten, Dynamic Island und eine iOS-Statusleiste mit Uhrzeit, "
+            "Mobilfunk/WLAN und Batterie sichtbar sein. Bediene diesen gerahmten "
+            "Stand im Browser, prüfe Konsole und Netzwerk und benenne den Beleg "
+            "im Abschluss ausdrücklich."
+        )
+        print(json.dumps({"decision": "block", "reason": reason}))
+        log(session_id, "blockiert(iphone-rahmen)", "Mobile-UI ohne Vollrahmen-Nachweis")
+        return
 
-    # Ein echter neuer Nutzerturn darf eine verwaiste Sperre aus einem zuvor
-    # abgebrochenen Audit ersetzen. Innerhalb der automatisch erzeugten
-    # Fortsetzung ist `stop_hook_active` dagegen wahr und die Sperre bleibt.
-    if pending_audit and not payload.get("stop_hook_active", False):
+    # Altlasten des früheren universellen Abschlussaudits nicht in neue
+    # Stopversuche hineintragen.
+    if audit_pending(session_id):
         clear_audit_pending(session_id)
-        pending_audit = False
-
-    if pending_audit and not has_tool_activity and not attested:
-        reason = (
-            "AUDIT NOCH NICHT AUSGEFÜHRT: Seit der erzwungenen Fortsetzung "
-            "wurde kein Werkzeug benutzt. Eine Ankündigung wie 'ich repariere "
-            "zuerst' ist keine Fortsetzung der Arbeit. Führe JETZT den nächsten "
-            "konkreten Werkzeugschritt aus und arbeite den Originalauftrag bis "
-            "zum verifizierten Ergebnis weiter ab."
-        )
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(audit-offen)", "kein Werkzeug seit Audit")
-        return
-
-    if (
-        has_tool_activity
-        and not payload.get("stop_hook_active", False)
-        and not pending_audit
-        and not attested
-    ):
-        reason = (
-            "ABSCHLUSSAUDIT ERFORDERLICH: In diesem Turn wurden Werkzeuge "
-            "verwendet. Prüfe den ORIGINALAUFTRAG jetzt Punkt für Punkt gegen "
-            "den tatsächlichen Stand. Erfasse jede noch offene Arbeit als Task "
-            "und erledige alle selbstständig bearbeitbaren Punkte sofort. "
-            "Prüfe die relevanten Tests/Laufzeitnachweise. Antworte erst danach "
-            "abschließend. Eine bloße Wiederholung des bisherigen Berichts oder "
-            "das Umbenennen von Restarbeit in 'nächster Ausbau' besteht diesen "
-            "Audit nicht. Der abschließende Bericht muss nach dem Audit eine "
-            "eigene Zeile 'AUFTRAG VOLLSTÄNDIG ERLEDIGT' enthalten. Falls "
-            "wirklich jede Restarbeit extern blockiert ist, verwende stattdessen "
-            "'BLOCKED_ON_USER: <konkreter benötigter Input mit Beleg>'. Der "
-            "Audit bezieht sich ausschließlich auf den erteilten "
-            "Originalauftrag. Er autorisiert keine Umsetzung bloßer "
-            "Empfehlungen, Optionen oder zusätzlich entdeckter Verbesserungen."
-        )
-        set_audit_pending(session_id)
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(audit)", "erster Stop nach Tool-Aktivität")
-        return
-
-
-    if pending_audit and has_tool_activity and not attested:
-        reason = (
-            "ABSCHLUSSBESTÄTIGUNG FEHLT: Der Werkzeuglauf nach dem Audit ist "
-            "vorhanden, aber der Bericht bestätigt den Originalauftrag nicht "
-            "strukturiert. Prüfe alle Akzeptanzpunkte erneut. Wenn alles erledigt "
-            "ist, sende den belegten Abschluss mit einer eigenen Zeile "
-            "'AUFTRAG VOLLSTÄNDIG ERLEDIGT'. Bei einem vollständigen externen "
-            "Blocker verwende 'BLOCKED_ON_USER: <konkreter Input mit Beleg>'. "
-            "Restarbeit und eine Vollständigkeitsbestätigung dürfen nicht "
-            "gleichzeitig vorkommen."
-        )
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(attestierung)", "Werkzeuglauf ohne Abschlussbestätigung")
-        return
-
-    if pending_audit and attested:
-        clear_audit_pending(session_id)
-        log(session_id, "audit-erfüllt", "strukturierte Abschlussbestätigung erkannt")
+        log(session_id, "audit-altlast-entfernt", "universeller Abschlussaudit deaktiviert")
 
     log(session_id, "durchgelassen", "keine offenen Tasks, kein Muster")
 
