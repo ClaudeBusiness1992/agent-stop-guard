@@ -79,6 +79,40 @@ class MarkerTests(unittest.TestCase):
         self.assert_blocked_text("Die native Prüfung bleibt noch aus.")
         self.assert_blocked_text("Ich konnte den Import noch nicht abschließen.")
 
+    def test_unfertige_architektur_aenderung_wird_erkannt(self):
+        text = (
+            "Die vorhandene unfertige Änderung gruppiert zwar Anbieter und Modelle, "
+            "ist aber noch nicht einklappbar, und Architektur wird noch nicht separat "
+            "erkannt. Ich ändere jetzt bewusst nichts."
+        )
+        self.assertTrue(GUARD.has_current_scope_incomplete_marker(text))
+
+    def test_noch_nicht_implementiert_wird_als_restarbeit_erkannt(self):
+        self.assertTrue(
+            GUARD.has_current_scope_incomplete_marker(
+                "Die Gruppierung ist derzeit noch nicht implementiert."
+            )
+        )
+
+    def test_bewusstes_nichtaendern_und_uhrzeit_vertagung(self):
+        self.assertTrue(
+            GUARD.has_execution_deferral_marker(
+                "Ich ändere jetzt bewusst nichts."
+            )
+        )
+        self.assertTrue(
+            GUARD.has_execution_deferral_marker(
+                "Nach 16:00 Uhr kann die Funktion ergänzt, getestet und aktiviert werden."
+            )
+        )
+
+    def test_optionale_empfehlung_ist_keine_ausfuehrungsvertagung(self):
+        self.assertFalse(
+            GUARD.has_execution_deferral_marker(
+                "Optional wäre später eine weitere Gruppierung denkbar."
+            )
+        )
+
     def test_reine_reparaturankuendigung_wird_erkannt(self):
         self.assert_blocked_text(
             "Ich repariere zuerst die laufende Vorschau-Umgebung und "
@@ -255,6 +289,60 @@ class ToolActivityTests(unittest.TestCase):
         })
         self.assertEqual(output, "")
         self.assertFalse(GUARD.audit_pending(session_id))
+
+    def test_architektur_teilabschluss_blockiert_den_ersten_stop(self):
+        session_id = "unit-architecture-incomplete-stop"
+        self.addCleanup(GUARD.clear_audit_pending, session_id)
+        GUARD.clear_audit_pending(session_id)
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Die vorhandene unfertige Änderung gruppiert zwar Anbieter und Modelle, "
+                "ist aber noch nicht einklappbar, und Architektur wird noch nicht separat "
+                "erkannt. Ich ändere jetzt bewusst nichts."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(json.loads(output)["decision"], "block")
+        self.assertTrue(GUARD.audit_pending(session_id))
+
+    def test_reine_statusantwort_ohne_arbeitslauf_bleibt_erlaubt(self):
+        session_id = "unit-status-answer-no-work"
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": "Die Gruppierung ist derzeit noch nicht implementiert.",
+            "stop_hook_active": False,
+        })
+        self.assertEqual(output, "")
+
+    def test_belegter_nutzerblocker_erlaubt_unfertigen_status(self):
+        session_id = "unit-incomplete-with-real-user-blocker"
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Die Gruppierung ist noch nicht implementiert.\n\n"
+                "BLOCKED_ON_USER: Die erforderliche Designentscheidung fehlt; "
+                "nur der Nutzer kann Variante A oder B bestätigen."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(output, "")
 
     def test_arbeitsversprechen_blockiert_nur_das_echte_versprechen(self):
         session_id = "unit-promise-latches-audit"
@@ -556,9 +644,10 @@ class ToolActivityTests(unittest.TestCase):
                 "type": "custom_tool_call",
                 "input": (
                     "Expo App.tsx Screenshot mit DeviceFrame iPhone-15-Pro-Geräterahmen, "
-                    "Dynamic Island und iOS-Statusleiste"
+                    "Dynamic Island und iOS-Statusleiste; view_image"
                 ),
             }},
+            {"type": "custom_tool_call_output", "output": "image inspected"},
         ])
         self.assertEqual(GUARD.mobile_ui_frame_state(path), (True, True))
 

@@ -5,6 +5,8 @@ offene/unerledigte Punkte ankündigt, statt sie abzuarbeiten.
 Max. MAX_BLOCKS Blockaden pro Session als Endlosschleifen-Schutz.
 """
 import datetime
+import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -14,6 +16,12 @@ import sys
 # deutlich größeres Budget (siehe main) - offene Arbeit wiegt schwerer als
 # eine unglücklich formulierte Antwort.
 MAX_BLOCKS = 8
+STATE_TTL_DAYS = 30
+MAX_LOG_BYTES = 1024 * 1024
+LOG_RETAIN_BYTES = 512 * 1024
+GENERATED_STATE_FILE = re.compile(
+    r"^.+-[0-9a-f]{10}-(?:blocks(?:-[A-Za-z0-9_.-]+)?|audit-pending|follow-through-pending)$"
+)
 
 # Konkrete Statusaussagen, die einer behaupteten Vollständigkeit widersprechen.
 # Sie sind bewusst KEIN eigenständiger Umsetzungsauftrag: In einem angeforderten
@@ -36,6 +44,10 @@ OPEN_STATUS_MARKERS = re.compile(
     r"(?:ausbau|schritt|durchgang|phase)"
     r"|(?:fehlt|fehlen|bleibt|bleiben) noch\b"
     r"|noch (?:lokal(?:e[rnms]?)?\s+)?umzusetzen\b"
+    r"|\bnoch nichts\b.{0,80}\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet)\b"
+    r"|\b(?:wurde|wurden|ist|sind)\b.{0,100}\b(?:noch\s+)?nicht\b.{0,50}\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|ver[öo]ffentlicht)\b"
     r"|konnte(?:n)? .{0,120}\bnoch nicht\b"
     r"|fertig (?:sind|ist) nur\b"
     r"|(?:wird|werden)\b.{0,80}\bnoch\b.{0,60}"
@@ -44,6 +56,66 @@ OPEN_STATUS_MARKERS = re.compile(
     r"|not yet (done|complete|implemented)"
     r")",
     re.IGNORECASE,
+)
+
+# Enges Signal dafuer, dass nicht nur ein Befund oder spaeterer Backlog
+# beschrieben wird, sondern der aktuell besprochene Arbeitsumfang nach eigener
+# Aussage noch nicht fertig ist. Diese Regel schliesst die Luecke, in der eine
+# Session auf die Kontrollfrage "alle Aufgaben erledigt?" mit "Nein" und einer
+# Restliste antwortete und trotzdem stoppte.
+CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
+    r"(\A\s*(?:nein[,;:]?\s*)?noch nicht(?:[.!]|\s*$)"
+    r"|\b(?:vorhandene|aktuelle|beauftragte)\s+unfertige\s+"
+    r"(?:[äa]nderung|umsetzung)\b"
+    r"|\b(?:ist|sind|wurde|wurden)\b.{0,100}\bnoch nicht\b.{0,60}\b"
+    r"(?:implementiert|einklappbar|separat\s+erkannt|umgesetzt|fertig)\b"
+    r"|\b(?:nein[,;:]?\s*)?noch nicht alles\b"
+    r"|noch nicht (?:alle|s[aä]mtliche|vollst[aä]ndig|komplett)\s+"
+    r"(?:gesamt)?aufgaben\b"
+    r"|\b(?:es|hier|daf[üu]r|vor\b.{0,80})\s+fehlen noch\b"
+    r"|\bfehlen noch\s*:\s*"
+    r"|\b(?:auftrag|aufgabe|prozess|app|anwendung|projekt|umsetzung)\b"
+    r".{0,100}\b(?:insgesamt\s+)?noch nicht\b.{0,80}"
+    r"\b(?:fertig|abgeschlossen|erledigt|bereit|build[- ]?fertig|"
+    r"ver[öo]ffentlichungs[- ]?fertig|release[- ]?ready)\b"
+    r"|\bbleibt(?: weiterhin)?\b.{0,100}\b(?:ein|der|dieser|separater)\s+"
+    r"offene[rnms]?\s+(?:punkt|aufgabe|arbeit)\b"
+    r"|\bnoch nichts\b.{0,80}\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet)\b"
+    r"|\b(?:fix|auftrag|aufgabe|reparatur|umsetzung|[äa]nderung)\b"
+    r".{0,100}\b(?:wurde|wurden|ist|sind)\b.{0,40}\b(?:noch\s+)?nicht\b"
+    r".{0,50}\b(?:repariert|behoben|umgesetzt|erledigt|ver[öo]ffentlicht)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+COMPLETION_CHECK_PROMPT = re.compile(
+    r"(?:\balles\b.{0,50}\b"
+    r"(?:erledigt|fertig|abgeschlossen|umgesetzt)\b"
+    r"|\b(?:alle|s[aä]mtliche)\b.{0,50}\b"
+    r"(?:erledigt|fertig|abgeschlossen|umgesetzt)\b"
+    r"|\b(?:ist|sind)\b.{0,40}\b(?:alles|alle)\b.{0,40}"
+    r"\b(?:fertig|erledigt|abgeschlossen|umgesetzt)\b"
+    r"|\bnoch\b.{0,40}\b(?:aufgaben|punkte|arbeit)\b.{0,30}\boffen\b"
+    r"|\b(?:fertig|erledigt|abgeschlossen|umgesetzt)\s*\?\s*$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+READ_ONLY_SCOPE_PROMPT = re.compile(
+    r"\b(?:read[- ]?only|nur\s+(?:pr[üu]fen|analysieren|bewerten|ansehen|"
+    r"nachsehen)|audit(?:ieren)?|review(?:en)?|analyse|bestandsaufnahme|"
+    r"keine\s+(?:[äa]nderungen|umsetzung)|nichts\s+(?:[äa]ndern|umsetzen))\b",
+    re.IGNORECASE,
+)
+
+# Eigenmächtiges Abbrechen oder Vertagen ist nur zusammen mit einem bereits
+# belegten Arbeitslauf ein Fortsetzungssignal. Dadurch bleiben reine
+# Statusfragen und Read-only-Befunde ohne Änderungsauftrag unbeeinträchtigt.
+EXECUTION_DEFERRAL_MARKERS = re.compile(
+    r"(?:\bich\s+[äa]ndere\s+(?:jetzt\s+)?bewusst\s+nichts\b"
+    r"|\bich\s+nehme\s+(?:jetzt\s+)?bewusst\s+keine\s+[äa]nderungen\s+vor\b"
+    r"|\b(?:nach|ab)\s+\d{1,2}(?::\d{2})?\s*uhr\b.{0,100}\b"
+    r"(?:erg[aä]nzt|implementiert|umgesetzt|getestet|aktiviert)\b)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Eindeutige Ich-Ankündigungen sind dagegen echte Fortsetzungsversprechen.
@@ -61,6 +133,25 @@ WORK_PROMISE_MARKERS = re.compile(
     r"|ich (arbeite|mache) (jetzt|gleich|direkt|nun|sofort) .{0,60}weiter"
     r"|ich (?:mache|arbeite) weiter\b"
     r"|ich arbeite .{0,80}\bjetzt\b.{0,40}\bab\b"
+    # Lücke vom 08.08.2026: Ein Arbeitsversprechen braucht kein Adverb, und die
+    # deutsche Trennung schiebt die Vorsilbe ans Satzende — beliebig weit weg
+    # vom Verb. "Ich arbeite die der Reihe nach ab", "Solange mache ich die
+    # Reparaturen fertig" und "Ich mache mit der Zeilenausrichtung weiter"
+    # beendeten vier Turns, ohne dass der Guard anschlug. Deshalb wird hier das
+    # Muster Verb + beliebiges Mittelfeld + Vorsilbe erfasst statt einzelner
+    # Formulierungen. Verneinungen im Mittelfeld schließen den Treffer aus.
+    r"|ich (?:mache|arbeite|gehe|fahre|setze|bringe|ziehe|hole|f[üu]hre"
+    r"|schlie[ßs]e)\s"
+    r"(?:(?!\bnicht\b|\bkein)[^\n]){0,80}"
+    r"\b(?:weiter|fort|fertig|ab(?!\s+und\s+zu\b)|durch|zu ende)\b"
+    # Vorangestelltes Objekt kehrt die Wortstellung um ("Das prüfe ich").
+    # Verneinungen sind ausgenommen — "das mache ich nicht" ist eine Absage,
+    # kein Fortsetzungsversprechen.
+    r"|(?:^|[.!?;:]\s|\n|—\s|,\s)"
+    r"(?:das|die|den|dies|dieses|solange|danach|anschlie[ßs]end|zuerst|erst|dann)"
+    r"\b[^\n.!?]{0,60}\b"
+    r"(?:mache|pr[üu]fe|teste|baue|erledige|repariere|kl[äa]re|schaue|arbeite|hole)"
+    r"\s+ich\b(?!\s*(?:nicht|nie|ungern|kaum))"
     r"|ich (?:repariere|behebe|korrigiere|ersetze|wiederhole|pr[üu]fe|teste) "
     r"(?:zuerst|jetzt|gleich|direkt|nun|als n[äa]chstes)"
     r"|ich (beginne|starte|fange|lege) (jetzt|gleich|nun|direkt|sofort)"
@@ -80,8 +171,17 @@ LOCAL_UNFINISHED_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
+# Zitierte Beispiele sind keine eigenen Zusagen. Öffnendes und schließendes
+# Zeichen müssen dafür NICHT vom selben Typ sein: Chat- und Editorautokorrektur
+# erzeugt regelmäßig gemischte Paare wie „…" (deutsches Auf, gerades Zu). Vor
+# dem 08.08.2026 blieben genau diese Zitate stehen und wurden anschließend als
+# Arbeitsversprechen der eigenen Session gewertet — der Guard blockierte einen
+# Bericht, der fremde Sätze nur belegte.
 QUOTED_EXAMPLES = re.compile(
-    r"`[^`\n]*`|„[^“\n]*“|“[^”\n]*”|\"[^\"\n]*\""
+    r"`[^`\n]*`"
+    r"|„[^„“”\"\n]*[“”\"]"
+    r"|“[^„“”\"\n]*[”\"]"
+    r"|\"[^„“”\"\n]*[\"”]"
 )
 
 
@@ -97,6 +197,16 @@ def has_open_work_marker(text):
 def has_open_status_marker(text):
     without_examples = QUOTED_EXAMPLES.sub("", text)
     return OPEN_STATUS_MARKERS.search(without_examples) is not None
+
+
+def has_current_scope_incomplete_marker(text):
+    without_examples = QUOTED_EXAMPLES.sub("", text)
+    return CURRENT_SCOPE_INCOMPLETE_MARKERS.search(without_examples) is not None
+
+
+def has_execution_deferral_marker(text):
+    without_examples = QUOTED_EXAMPLES.sub("", text)
+    return EXECUTION_DEFERRAL_MARKERS.search(without_examples) is not None
 
 
 def has_work_promise(text):
@@ -117,6 +227,40 @@ NON_SPECIFIC_BLOCKERS = re.compile(
     r"[.!\s]*$",
     re.IGNORECASE,
 )
+WEAK_BLOCKER_PHRASES = re.compile(
+    r"\b(?:ich m[öo]chte|vielleicht|irgendwann|allgemeine freigabe|"
+    r"keine lust|sp[aä]ter machen)\b",
+    re.IGNORECASE,
+)
+BLOCKER_EVIDENCE = re.compile(
+    r"\b(?:fehl(?:t|en|end\w*)|ben[öo]tig\w*|brauch(?:e|t|en)|muss|erforderlich|nur (?:nick|der nutzer|"
+    r"die nutzerin)|nicht erreichbar|nicht verf[üu]gbar|abgelehnt|gesperrt|"
+    r"timeout|error|fehler|http\s*[45]\d\d|enodata|eacces|permission|"
+    r"physisch\w*|registriert\w*|installier\w*|bedien\w*|freigabe|entscheidung|"
+    r"eingabe|antwort|zugang|w[aä]hl\w*|best[aä]tig\w*|bereitstell\w*|"
+    r"schl[üu]ssel|key|eas_status_(?:finished|failed)|"
+    r"is_for_ios_simulator_false|(?:idevice_tool|usbmuxd_socket|usb_device_bus)_missing)\b",
+    re.IGNORECASE,
+)
+
+EXPLICIT_RELEASE_AUTHORIZATION = re.compile(
+    r"(?=.*\b(?:ota|eas[- ]?update|preview[- ]?update|deploy(?:ment|en)?|"
+    r"ver[öo]ffentlich(?:en|ung)|release)\b)"
+    r"(?=.*\b(?:kannst|darfst|sollst|mach(?:en)?|f[üu]hr(?:e|en)|"
+    r"ver[öo]ffentlich\w*|freig(?:abe|egeben)|hauptsitzung|hauptsession)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+RELEASE_SESSION_DEFLECTION = re.compile(
+    r"(?=.*\b(?:ota|eas[- ]?update|preview[- ]?update|deploy(?:ment|en)?|"
+    r"ver[öo]ffentlich(?:en|ung)|release)\b)"
+    r"(?=.*(?:\breleaseberechtigt\w*\s+(?:haupt)?sitzung\b|"
+    r"\bandere\w*\s+(?:releaseberechtigt\w*\s+)?(?:haupt)?sitzung\b|"
+    r"\b(?:workflow|arbeitsablauf|rolle|diese\w*\s+sitzung)\b.{0,180}"
+    r"\b(?:untersagt|verbietet|darf\w*\s+nicht|erlaubt\w*\s+nicht)\b|"
+    r"\b(?:untersagt|verbietet|darf\w*\s+nicht|erlaubt\w*\s+nicht)\b.{0,180}"
+    r"\b(?:workflow|arbeitsablauf|rolle|diese\w*\s+sitzung)\b))",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def blocked_on_user_detail(text):
@@ -124,10 +268,39 @@ def blocked_on_user_detail(text):
     match = BLOCKED_ATTESTATION_LINE.search(text)
     if not match:
         return None
-    detail = match.group("detail").strip()
-    if len(detail) < 12 or NON_SPECIFIC_BLOCKERS.fullmatch(detail):
+    detail_lines = [match.group("detail").strip()]
+    # Terminal- und Chatoberflächen brechen lange Abschlusszeilen häufig hart
+    # um. Der Blocker ist deshalb der gesamte Absatz, nicht nur die erste
+    # physische Zeile nach dem Marker.
+    remainder = text[match.end():].lstrip("\r\n")
+    for line in remainder.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            break
+        if re.match(r"(?:BLOCKED_ON_USER:|AUFTRAG VOLLSTÄNDIG ERLEDIGT)", stripped, re.I):
+            break
+        detail_lines.append(stripped)
+    detail = " ".join(part for part in detail_lines if part).strip()
+    if (
+        len(detail) < 12
+        or NON_SPECIFIC_BLOCKERS.fullmatch(detail)
+        or WEAK_BLOCKER_PHRASES.search(detail)
+        or not BLOCKER_EVIDENCE.search(detail)
+    ):
         return None
     return detail
+
+
+def has_blocker_attestation_line(text):
+    return BLOCKED_ATTESTATION_LINE.search(text or "") is not None
+
+
+def contradicts_explicit_release_authorization(user_text, assistant_text):
+    """Verhindert erfundene Worker-/Sitzungsgrenzen nach Release-Freigabe."""
+    return bool(
+        EXPLICIT_RELEASE_AUTHORIZATION.search(user_text or "")
+        and RELEASE_SESSION_DEFLECTION.search(assistant_text or "")
+    )
 
 
 def has_completion_attestation(text):
@@ -149,6 +322,53 @@ def has_full_completion_attestation(text):
 
 def has_blocked_attestation(text):
     return blocked_on_user_detail(text) is not None
+
+
+PHYSICAL_DEVICE_BLOCKER = re.compile(
+    r"(?=.*\b(?:physisch(?:e[nmrs]?|en)?|registriert(?:e[nmrs]?|en)?|"
+    r"nativ(?:e[nmrs]?|en)?|installier\w*)\b)"
+    r"(?=.*\b(?:iphone|ios[- ]ger[aä]t|ger[aä]t)\b)"
+    r"(?=.*\b(?:[öo]ffnen|ge[öo]ffnet|starten|ausf[üu]hren|testen|pr[üu]fen|"
+    r"bedien\w*|teil(?:en|t)|testergebnis|"
+    r"(?:ger[aä]te)?absturz|crash|hardware)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def requires_physical_device_validation(text):
+    """Erkennt belegte Blocker, die ein echtes iOS-Gerät voraussetzen.
+
+    Ein Browser-Geräterahmen prüft Layout und Bedienung, kann aber einen nur
+    nativ reproduzierbaren Start oder Absturz auf Hardware nicht verifizieren.
+    Die Ausnahme bleibt deshalb an eine konkrete BLOCKED_ON_USER-Zeile und an
+    mehrere unabhängige Hardware-Signale gebunden.
+    """
+    detail = blocked_on_user_detail(text)
+    return bool(detail and PHYSICAL_DEVICE_BLOCKER.search(detail))
+
+
+EXTERNAL_EAS_BUILD_PENDING = re.compile(
+    r"(?=.*\b(?:eas|expo|ios)[- ]?(?:ios[- ]?)?build\b|"
+    r"(?=.*expo\.dev/.*/builds/))"
+    r"(?=.*\b(?:noch in bearbeitung|in bearbeitung|build l[äa]uft|"
+    r"wird (?:gerade |aktuell )?(?:erstellt|gebaut)|queued|in progress|pending)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def waits_for_external_eas_build(text):
+    """Erkennt einen bereits gestarteten, extern weiterlaufenden EAS-Build.
+
+    Dieser Zustand ist weder ein fehlender Browser-Nachweis noch Nutzerinput.
+    Die Ausnahme ist bewusst eng auf EAS/Expo-Buildsprache plus einen expliziten
+    laufenden Status begrenzt; lokale Restarbeit wird dadurch nicht verdeckt.
+    """
+    return bool(
+        text
+        and EXTERNAL_EAS_BUILD_PENDING.search(text)
+        and not has_work_promise(text)
+        and not has_local_unfinished_marker(text)
+    )
 
 
 def last_assistant_text(transcript_path):
@@ -197,6 +417,60 @@ def _is_real_user_message(entry):
     )
 
 
+def _user_message_text(entry):
+    """Liest sichtbaren Nutzertext aus Codex- oder Claude-Transkripten."""
+    if entry.get("type") == "response_item":
+        message = entry.get("payload") or {}
+    else:
+        message = entry.get("message") or {}
+    if message.get("role") != "user":
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") in ("text", "input_text")
+    ).strip()
+
+
+def _is_stop_hook_prompt(entry):
+    """Erkennt nur die von Codex injizierte automatische Stop-Fortsetzung."""
+    return _user_message_text(entry).lstrip().lower().startswith("<hook_prompt")
+
+
+def last_actual_user_text(transcript_path):
+    """Letzter echter Prompt, ohne vom Stop-Hook injizierte Fortsetzung."""
+    latest = ""
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not _is_real_user_message(entry):
+                    continue
+                candidate = _user_message_text(entry)
+                if not candidate or _is_stop_hook_prompt(entry):
+                    continue
+                latest = candidate
+    except OSError:
+        return ""
+    return latest
+
+
+def user_asked_completion_check(transcript_path):
+    return bool(COMPLETION_CHECK_PROMPT.search(last_actual_user_text(transcript_path)))
+
+
+def user_requested_read_only_scope(transcript_path):
+    return bool(READ_ONLY_SCOPE_PROMPT.search(last_actual_user_text(transcript_path)))
+
+
 def _is_tool_activity(entry):
     """Providerneutrale Erkennung von Codex- und Claude-Toolaufrufen."""
     if entry.get("type") == "response_item":
@@ -230,7 +504,7 @@ def turn_has_tool_activity(transcript_path):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry):
+                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
                     has_tool_activity = False
                     continue
                 if _is_tool_activity(entry):
@@ -238,6 +512,105 @@ def turn_has_tool_activity(transcript_path):
     except OSError:
         return False
     return has_tool_activity
+
+
+def continuation_has_tool_activity(transcript_path):
+    """Prüft Arbeit nach der jüngsten automatisch injizierten Stop-Fortsetzung.
+
+    Sobald der Hook-Prompt im Transkript steht, zählt ausschließlich danach
+    gestartete Arbeit. Ohne sichtbaren Hook-Prompt bleibt aus Kompatibilitäts-
+    gründen die normale Turn-Erkennung maßgeblich.
+    """
+    hook_prompt_seen = False
+    has_tool_activity = False
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if _is_real_user_message(entry):
+                    if _is_stop_hook_prompt(entry):
+                        hook_prompt_seen = True
+                        has_tool_activity = False
+                    else:
+                        hook_prompt_seen = False
+                        has_tool_activity = False
+                    continue
+                if hook_prompt_seen and _is_tool_activity(entry):
+                    has_tool_activity = True
+    except OSError:
+        return False
+    return (
+        has_tool_activity
+        if hook_prompt_seen
+        else turn_has_tool_activity(transcript_path)
+    )
+
+
+RUNNING_CELL = re.compile(
+    r"^\s*Script running with cell ID\s+([A-Za-z0-9._:-]+)(?:\s|$)", re.I
+)
+CELL_ID_FIELD = re.compile(
+    r"(?:cell_id|cellId)\s*[\"']?\s*[:=]\s*[\"'](?P<id>[A-Za-z0-9._:-]+)[\"']",
+    re.I,
+)
+
+
+def _payload_text(payload):
+    value = payload.get("output")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(
+            item.get("text", "")
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
+def codex_open_exec_cells(transcript_path):
+    """Findet im aktuellen Nutzerturn gestartete, noch nicht abgeholte Exec-Cells."""
+    open_cells = set()
+    wait_calls = {}
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
+                    open_cells.clear()
+                    wait_calls.clear()
+                    continue
+                if entry.get("type") != "response_item":
+                    continue
+                payload = entry.get("payload") or {}
+                kind = payload.get("type")
+                if kind in ("custom_tool_call", "function_call"):
+                    name = str(payload.get("name") or "").lower()
+                    raw = payload.get("input") or payload.get("arguments") or ""
+                    if not isinstance(raw, str):
+                        raw = json.dumps(raw, ensure_ascii=False)
+                    if name.endswith("wait") or "tools.wait(" in raw:
+                        match = CELL_ID_FIELD.search(raw)
+                        if match and payload.get("call_id"):
+                            wait_calls[payload["call_id"]] = match.group("id")
+                elif kind in ("custom_tool_call_output", "function_call_output"):
+                    output = _payload_text(payload)
+                    running = RUNNING_CELL.match(output)
+                    if running:
+                        open_cells.add(running.group(1))
+                    call_id = payload.get("call_id")
+                    waited_cell = wait_calls.pop(call_id, None)
+                    if waited_cell and not RUNNING_CELL.match(output):
+                        open_cells.discard(waited_cell)
+    except OSError:
+        return []
+    return sorted(open_cells)
 
 
 PLAN_FIELD = re.compile(
@@ -338,12 +711,89 @@ def plan_item_blocked_on_user(item):
     )
 
 
+UNICODE_HYPHENS = str.maketrans({
+    "‐": "-",  # U+2010 HYPHEN
+    "‑": "-",  # U+2011 NON-BREAKING HYPHEN
+    "‒": "-",  # U+2012 FIGURE DASH
+    "–": "-",  # U+2013 EN DASH
+    "—": "-",  # U+2014 EM DASH
+    "−": "-",  # U+2212 MINUS SIGN
+})
+
+
+def normalize_visual_text(text):
+    """Vereinheitlicht typografische Bindestriche in sichtbaren Nachweisen."""
+    return str(text or "").lower().translate(UNICODE_HYPHENS)
+
+
+MOBILE_UI_PROOF_CLAIM = re.compile(
+    r"(?:mobile(?:n|r)?\s+ui[- ]pr[üu]fung|mobile\s+(?:ansicht|ui).{0,80}"
+    r"(?:gepr[üu]ft|getestet|nachweis)|iphone[- ]nachweis)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def claims_mobile_ui_proof(text):
+    """Nur eine ausdrückliche mobile Beweisbehauptung aktiviert das harte Gate.
+
+    Mobile/Expo-Werkzeuge und die bloße Nennung einer Viewport-Größe sind kein
+    Grund, beim Stoppen ungefragte Zusatzarbeit zu erzwingen. Die Projektregel
+    bleibt eine Arbeitsanweisung; der Hook korrigiert nur einen ausdrücklich
+    behaupteten, aber ungültigen mobilen Nachweis.
+    """
+    return bool(MOBILE_UI_PROOF_CLAIM.search(normalize_visual_text(text)))
+
+
+NATIVE_IOS_PROOF_BLOCKER = re.compile(
+    r"\b(?:nicht verbunden|verbindung fehlgeschlagen|wartet auf (?:eine )?verbindung|"
+    r"noch nicht (?:geladen|geb[üu]ndelt)|bundle fehlgeschlagen|"
+    r"development[- ]build nicht (?:erreichbar|geladen))\b",
+    re.IGNORECASE,
+)
+
+
+def has_native_ios_device_proof(text):
+    """Akzeptiert einen geladenen iOS-Development-Build als stärkeren Nachweis.
+
+    Ein bloß gestarteter Metro-Server oder ein wartender Development-Build
+    reicht nicht. Der Abschluss muss zugleich einen verbundenen iOS-
+    Development-Build, Metro und das tatsächlich erfolgte Bündeln oder Laden
+    belegen. Damit hat ein echter nativer Gerätelauf Vorrang vor einer
+    nachgebildeten Browserhülle, ohne reine Startmeldungen hochzustufen.
+    """
+    normalized = normalize_visual_text(text)
+    if NATIVE_IOS_PROOF_BLOCKER.search(normalized):
+        return False
+    development_build = bool(
+        re.search(r"\bios[- ]development[- ]build\b", normalized)
+        or re.search(r"\bdevelopment[- ]build\b.{0,40}\bios\b", normalized)
+    )
+    connected = bool(
+        re.search(
+            r"\bverbunden\w*\b.{0,100}\bios[- ]development[- ]build\b|"
+            r"\bios[- ]development[- ]build\b.{0,100}\bverbunden\w*\b|"
+            r"\bauf\b.{0,80}\b(?:iphone|ios[- ]ger[aä]t)\b",
+            normalized,
+        )
+    )
+    loaded = bool(
+        re.search(
+            r"\b(?:neu\s+)?(?:geb[üu]ndelt|geladen)\b|"
+            r"\b(?:re)?bundled\b|\b(?:re)?loaded\b|\breload(?:ed)?\b",
+            normalized,
+        )
+    )
+    return development_build and connected and "metro" in normalized and loaded
+
+
 def mobile_ui_frame_state(transcript_path, assistant_text=""):
     """Erkennt Mobile-UI-Prüfungen und den geforderten Vollrahmen-Nachweis."""
     has_tool_activity = False
     platform_signal = False
     visual_signal = False
-    frame_text = assistant_text.lower()
+    inspected_visual_artifact = False
+    visual_inspection_pending = False
+    frame_text = normalize_visual_text(assistant_text)
     try:
         with open(transcript_path, encoding="utf-8") as f:
             for line in f:
@@ -351,11 +801,13 @@ def mobile_ui_frame_state(transcript_path, assistant_text=""):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry):
+                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
                     has_tool_activity = False
                     platform_signal = False
                     visual_signal = False
-                    frame_text = assistant_text.lower()
+                    inspected_visual_artifact = False
+                    visual_inspection_pending = False
+                    frame_text = normalize_visual_text(assistant_text)
                     continue
                 raw = json.dumps(entry, ensure_ascii=False).lower()
                 if _is_tool_activity(entry):
@@ -394,11 +846,23 @@ def mobile_ui_frame_state(transcript_path, assistant_text=""):
                         )
                     ):
                         visual_signal = True
-                    frame_text += "\n" + raw
+                    payload = entry.get("payload") or {}
+                    tool_name = str(payload.get("name") or "").lower()
+                    tool_input = str(payload.get("input") or payload.get("arguments") or "").lower()
+                    if "view_image" in tool_name or "view_image" in tool_input:
+                        visual_inspection_pending = True
+                    frame_text += "\n" + normalize_visual_text(raw)
+                elif visual_inspection_pending and (
+                    entry.get("type") == "custom_tool_call_output"
+                    or '"type": "tool_result"' in raw
+                    or '"type":"tool_result"' in raw
+                ):
+                    inspected_visual_artifact = True
+                    visual_inspection_pending = False
                 elif entry.get("type") in ("event_msg", "response_item"):
                     payload = entry.get("payload") or {}
                     if payload.get("type") in ("agent_message", "message"):
-                        frame_text += "\n" + raw
+                        frame_text += "\n" + normalize_visual_text(raw)
     except OSError:
         return False, False
 
@@ -411,11 +875,42 @@ def mobile_ui_frame_state(transcript_path, assistant_text=""):
             "geraeterahmen",
             "deviceframe",
             "device frame",
+            "iphone-15-pro-rahmen",
+            "iphone 15 pro rahmen",
         )
     )
     island = "dynamic island" in frame_text
     status = "statusleiste" in frame_text or "status bar" in frame_text
-    return mobile_ui_work, device and frame and island and status
+    # Ein sauberer Abschluss darf den bereits geprüften Bildbeleg auch direkt
+    # benennen. Die konkrete Tool-Serialisierung von view_image unterscheidet
+    # sich zwischen Codex und Claude und ist deshalb kein zuverlässiges Gate.
+    # Akzeptiert wird nur eine detaillierte Attestierung mit Vollrahmen,
+    # exakter App-Fläche und einem konkreten Bildartefakt.
+    assistant_lower = normalize_visual_text(assistant_text)
+    exact_app_size = bool(
+        re.search(r"393\s*[×x]\s*852\s*(?:css[- ]?pixel|pixel)", assistant_lower)
+    )
+    # Chatoberflächen brechen lange Pfade mitten in Verzeichnis- und
+    # Dateinamen um. Für den Belegabgleich werden diese reinen Layoutumbrüche
+    # innerhalb des auf "Beleg:" folgenden Absatzes entfernt.
+    evidence_match = re.search(
+        r"(?:beleg|bildbeleg|screenshot)\s*:\s*(?P<path>[^\n]*(?:\n(?!\s*\n)[^\n]*){0,8})",
+        assistant_lower,
+    )
+    normalized_evidence = ""
+    if evidence_match:
+        normalized_evidence = re.sub(r"\s+", "", evidence_match.group("path"))
+    normalized_assistant = re.sub(r"\s+", "", assistant_lower)
+    image_evidence = bool(
+        re.search(r"\.png\b", normalized_evidence)
+        or re.search(r"\.png\b", normalized_assistant)
+    )
+    explicit_attestation = (
+        device and frame and island and status and exact_app_size and image_evidence
+    )
+    return mobile_ui_work, (
+        inspected_visual_artifact or explicit_attestation
+    ) and device and frame and island and status
 
 
 def last_assistant_phase(transcript_path):
@@ -456,7 +951,10 @@ KILL_SWITCH = os.path.join(STATE_ROOT, "disabled")
 
 
 def safe_session_id(session_id):
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
+    raw = str(session_id)
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:80]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{cleaned}-{digest}"
 
 
 def ensure_state_root():
@@ -465,6 +963,42 @@ def ensure_state_root():
         os.chmod(STATE_ROOT, 0o700)
     except OSError:
         pass
+
+
+def prune_state():
+    """Entfernt ausschließlich veraltete Guard-Zähler und Audit-Marker."""
+    cutoff = datetime.datetime.now().timestamp() - STATE_TTL_DAYS * 86400
+    try:
+        names = os.listdir(STATE_ROOT)
+    except OSError:
+        return
+    for name in names:
+        if name in (os.path.basename(LOG_PATH), os.path.basename(KILL_SWITCH)):
+            continue
+        if not GENERATED_STATE_FILE.fullmatch(name):
+            continue
+        path = os.path.join(STATE_ROOT, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def clear_block_counters(session_id):
+    """Startet das Schleifenbudget für einen echten neuen Nutzerturn neu."""
+    prefix = f"{safe_session_id(session_id)}-blocks"
+    try:
+        names = os.listdir(STATE_ROOT)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        try:
+            os.remove(os.path.join(STATE_ROOT, name))
+        except OSError:
+            pass
 
 
 def audit_pending_path(session_id):
@@ -493,9 +1027,47 @@ def clear_audit_pending(session_id):
         pass
 
 
+def followthrough_pending_path(session_id):
+    return os.path.join(
+        STATE_ROOT,
+        f"{safe_session_id(session_id)}-follow-through-pending",
+    )
+
+
+def followthrough_pending(session_id):
+    return os.path.exists(followthrough_pending_path(session_id))
+
+
+def set_followthrough_pending(session_id):
+    try:
+        ensure_state_root()
+        with open(followthrough_pending_path(session_id), "w", encoding="utf-8") as f:
+            f.write(datetime.datetime.now().isoformat(timespec="seconds"))
+    except OSError:
+        pass
+
+
+def clear_followthrough_pending(session_id):
+    try:
+        os.remove(followthrough_pending_path(session_id))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def log(session_id, decision, detail):
     try:
         ensure_state_root()
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
+            with open(LOG_PATH, "rb") as source:
+                source.seek(-LOG_RETAIN_BYTES, os.SEEK_END)
+                retained = source.read()
+            newline = retained.find(b"\n")
+            if newline >= 0:
+                retained = retained[newline + 1:]
+            with open(LOG_PATH, "wb") as target:
+                target.write(retained)
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(
                 f"{datetime.datetime.now().isoformat(timespec='seconds')}\t"
@@ -533,7 +1105,7 @@ def open_tasks(session_id):
     return found
 
 
-def block(session_id, reason, detail, limit, kind="text"):
+def block(session_id, reason, detail, limit, kind="text", fingerprint=None):
     # Getrennte Zähler je Regel: die harte Task-Regel darf das Budget der
     # weichen Textregel nicht aufbrauchen und umgekehrt.
     suffix = "" if kind == "text" else f"-{kind}"
@@ -541,17 +1113,19 @@ def block(session_id, reason, detail, limit, kind="text"):
     counter_file = os.path.join(
         STATE_ROOT, f"{safe_session_id(session_id)}-blocks{suffix}"
     )
+    fingerprint = fingerprint or hashlib.sha256(detail.encode("utf-8")).hexdigest()
     try:
         with open(counter_file, encoding="utf-8") as f:
-            count = int(f.read().strip() or "0")
-    except (OSError, ValueError):
+            stored = json.load(f)
+        count = int(stored.get("count", 0)) if stored.get("fingerprint") == fingerprint else 0
+    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
         count = 0
     if count >= limit:
         log(session_id, "durchgelassen", f"Budget {limit} erschöpft: {detail}")
         return False
     try:
         with open(counter_file, "w", encoding="utf-8") as f:
-            f.write(str(count + 1))
+            json.dump({"count": count + 1, "fingerprint": fingerprint}, f)
     except OSError:
         pass
     print(json.dumps({"decision": "block", "reason": reason}))
@@ -565,10 +1139,29 @@ def main():
     except json.JSONDecodeError:
         return
 
+    if payload.get("hook_event_name") == "PreToolUse":
+        sleep_guard_path = os.path.expanduser(
+            "~/.claude/hooks/pretool-sleep-guard.py"
+        )
+        try:
+            spec = importlib.util.spec_from_file_location("pretool_sleep_guard", sleep_guard_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            print(json.dumps(module.evaluate(payload)))
+        except (OSError, AttributeError, ImportError):
+            pass
+        return
+
     session_id = payload.get("session_id") or "unknown"
+    prune_state()
     if os.path.exists(KILL_SWITCH):
         log(session_id, "aus", f"Notausgang {KILL_SWITCH} aktiv")
         return
+    if (
+        payload.get("hook_event_name") == "Stop"
+        and payload.get("stop_hook_active") is False
+    ):
+        clear_block_counters(session_id)
 
     # Codex liefert die letzte Antwort direkt mit; Claude Code nur den Transcript-Pfad
     text = payload.get("last_assistant_message")
@@ -579,6 +1172,7 @@ def main():
     text = text or ""
 
     transcript_path = payload.get("transcript_path")
+    last_user_text = last_actual_user_text(transcript_path) if transcript_path else ""
     blocked_attested = has_blocked_attestation(text)
 
     # Eine Commentary-Nachricht ist per Definition ein Zwischenstand. Codex
@@ -593,9 +1187,86 @@ def main():
             "tatsächlichen Umsetzung und Verifikation mit einer finalen "
             "Abschlussnachricht."
         )
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(commentary)", "Turn endete auf Commentary-Phase")
-        return
+        if block(
+            session_id,
+            reason,
+            "Turn endete auf Commentary-Phase",
+            3,
+            kind="commentary",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
+
+    # Ein von Codex ausgelagerter Exec-Lauf bleibt Teil des aktuellen Auftrags.
+    # Solange seine Cell nicht mit dem Wait-Werkzeug bis zur Beendigung
+    # abgeholt wurde, darf der Kontaktagent den Turn nicht abschließen und den
+    # Router-Supervisor unbeaufsichtigt zurücklassen.
+    open_cells = codex_open_exec_cells(transcript_path) if transcript_path else []
+    if open_cells:
+        reason = (
+            "HINTERGRUNDLAUF NOCH AKTIV: Im aktuellen Nutzerturn laufen noch "
+            f"nicht abgeholte Werkzeug-Cells: {', '.join(open_cells)}. "
+            "Warte jede Cell mit dem vorgesehenen Wait-Werkzeug bis zur "
+            "tatsächlichen Beendigung ab und werte erst danach Ergebnis, "
+            "Routerstatus und gesicherte Ausgabe aus. Unveränderte Polls werden "
+            "nicht als Minutenprotokoll kommentiert; eine separate Statusabfrage "
+            "oder Textbehauptung beendet den Hintergrundlauf nicht."
+        )
+        if block(
+            session_id,
+            reason,
+            f"offene Exec-Cells: {', '.join(open_cells)}",
+            25,
+            kind="exec-cells",
+            fingerprint=hashlib.sha256("\n".join(open_cells).encode("utf-8")).hexdigest(),
+        ):
+            return
+
+    # Eine ausdrücklich erteilte Release-Freigabe darf nicht durch eine frei
+    # erfundene Worker-, Rollen- oder Sitzungsgrenze in einen Nutzerblocker
+    # umgedeutet werden. Echte technische Ablehnungen bleiben möglich, müssen
+    # aber mit ihrem konkreten Provider-, Login-, Berechtigungs- oder
+    # Laufzeitbeleg benannt werden.
+    if contradicts_explicit_release_authorization(last_user_text, text):
+        reason = (
+            "SCHEINBLOCKER WIDERSPRICHT DER NUTZERFREIGABE: Der letzte "
+            "Nutzerprompt erteilt beziehungsweise bestätigt die Release-/OTA-"
+            "Freigabe. Deine Antwort behauptet stattdessen ohne technischen "
+            "Beleg, diese Sitzung oder Rolle dürfe nicht veröffentlichen. "
+            "Übernimm keine Worker-Beschränkung für die Hauptsitzung. Prüfe "
+            "Kanal, Runtime, Anmeldung und enthaltenen Stand und führe die "
+            "freigegebene Veröffentlichung aus. Falls ein echter externer "
+            "Blocker auftritt, belege ihn konkret mit der tatsächlichen "
+            "Provider-, Login-, Berechtigungs- oder Laufzeitfehlermeldung."
+        )
+        if block(
+            session_id,
+            reason,
+            "Release-Freigabe durch unbelegte Sitzungsgrenze zurückgewiesen",
+            8,
+            kind="release-deflection",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
+
+    if has_blocker_attestation_line(text) and not blocked_attested:
+        reason = (
+            "UNGÜLTIGER NUTZERBLOCKER: Die Abschlusszeile BLOCKED_ON_USER ist "
+            "leer, vage, optional oder nicht durch einen konkret benötigten "
+            "Nutzerinput beziehungsweise einen realen Fehler belegt. Arbeite "
+            "den beauftragten Umfang weiter ab. Wenn wirklich nur die nutzende "
+            "Person fortfahren kann, nenne exakt die fehlende Entscheidung, "
+            "Eingabe, Berechtigung oder den unveränderten technischen Beleg."
+        )
+        if block(
+            session_id,
+            reason,
+            "formal vorhandener, aber unbelegter BLOCKED_ON_USER",
+            8,
+            kind="invalid-blocker",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
 
     # 1. Harte Regel: offene Tasks. Zählt unabhängig vom Antworttext und
     #    bekommt ein großes Budget - solange Arbeit offen ist, wird gearbeitet.
@@ -624,7 +1295,14 @@ def main():
             "Teilblockade beendet niemals den ganzen Lauf."
         )
         if block(
-            session_id, reason, f"{len(actionable_tasks)} offene Tasks", 25, kind="tasks"
+            session_id,
+            reason,
+            f"{len(actionable_tasks)} offene Tasks",
+            25,
+            kind="tasks",
+            fingerprint=hashlib.sha256(
+                json.dumps(actionable_tasks, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
         ):
             return
 
@@ -662,6 +1340,9 @@ def main():
             f"{len(actionable_plan)} offene Codex-Planpunkte",
             25,
             kind="plans",
+            fingerprint=hashlib.sha256(
+                json.dumps(actionable_plan, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
         ):
             return
 
@@ -673,11 +1354,71 @@ def main():
             "den konkret benötigten Nutzerinput mit rohem Beleg in einer "
             "eigenen Abschlusszeile 'BLOCKED_ON_USER: ...'."
         )
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(blocker-attestierung)", "geparkter Blocker ohne Abschlusszeile")
-        return
+        if block(
+            session_id,
+            reason,
+            "geparkter Blocker ohne Abschlusszeile",
+            3,
+            kind="blocker-attestation",
+            fingerprint=hashlib.sha256(
+                json.dumps(parked_tasks + parked_plan, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
+        ):
+            return
 
-    # 2. Weiche Textregel mit Scope-Schutz. Reine Befunde, Empfehlungen,
+    # 2. Harte Restarbeitsregel: Wenn eine Arbeitssession selbst einraeumt,
+    #    dass ihr aktueller Umfang noch nicht fertig ist, darf sie nicht mit
+    #    einem blossen Statusbericht enden. Besonders wichtig ist die explizite
+    #    Kontrollfrage "alle Aufgaben erledigt?": Ein ehrliches "Nein" muss
+    #    Fortsetzung oder einen belegten Nutzerblocker ausloesen.
+    completion_check = bool(COMPLETION_CHECK_PROMPT.search(last_user_text))
+    read_only_scope = bool(READ_ONLY_SCOPE_PROMPT.search(last_user_text))
+    admitted_current_rest = bool(
+        text
+        and (
+            has_current_scope_incomplete_marker(text)
+            or has_execution_deferral_marker(text)
+            or (completion_check and has_open_status_marker(text))
+        )
+    )
+    active_execution_scope = bool(
+        transcript_path
+        and not read_only_scope
+        and (
+            turn_has_tool_activity(transcript_path)
+            or payload.get("stop_hook_active") is True
+        )
+    )
+    if (
+        admitted_current_rest
+        and not blocked_attested
+        and ((completion_check and not read_only_scope) or active_execution_scope)
+    ):
+        set_audit_pending(session_id)
+        set_followthrough_pending(session_id)
+        reason = (
+            "STOPP VERWEIGERT: Deine eigene Abschlussantwort sagt, dass der "
+            "aktuell besprochene Arbeitsumfang noch nicht fertig ist. Ein "
+            "Statusbericht beendet den Auftrag nicht. Arbeite alle bereits "
+            "beauftragten und selbststaendig ausfuehrbaren Restpunkte JETZT "
+            "weiter ab. Erweitere den Nutzerauftrag dabei nicht: wirklich "
+            "optionale, spaetere oder nicht beauftragte Ideen musst du klar "
+            "als ausserhalb des aktuellen Auftrags abgrenzen. Wenn nach "
+            "Abarbeitung aller unabhaengigen Punkte nur eine Handlung der "
+            "nutzenden Person fehlt, beende mit einer eigenen Zeile "
+            "'BLOCKED_ON_USER: <konkreter Input und Beleg>'."
+        )
+        if block(
+            session_id,
+            reason,
+            "selbst eingeraeumte Restarbeit im aktuellen Umfang",
+            25,
+            kind="unfinished-status",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
+
+    # 3. Weiche Textregel mit Scope-Schutz. Reine Befunde, Empfehlungen,
     # Optionen und spätere Ausbauschritte sind kein Umsetzungsauftrag. Geblockt
     # werden nur eigene unmittelbare Arbeitsversprechen, ein konkreter lokaler
     # Rest neben BLOCKED_ON_USER oder ein Widerspruch zur Vollständigkeitszeile.
@@ -699,6 +1440,7 @@ def main():
         # offener Punkte durchrutschen, weil die erste Rückgabe den regulären
         # Abschlussaudit darunter noch nicht erreicht hat.
         set_audit_pending(session_id)
+        set_followthrough_pending(session_id)
         reason = (
             "Deine letzte Antwort enthält ein eigenes unmittelbares "
             "Arbeitsversprechen oder widerspricht ihrer strukturierten "
@@ -714,18 +1456,66 @@ def main():
         if block(session_id, reason, "Ankündigungsmuster im Text", MAX_BLOCKS):
             return
 
-    # 3. Spezifische UI-Sicherheitsregel. Allgemeine Werkzeugnutzung erzwingt
+    # Ein bereits blockierter Abschluss darf nicht mit einer sprachlich
+    # saubereren Ausrede im automatischen Fortsetzungsturn durchrutschen. Nach
+    # einer Restarbeits- oder Versprechensblockade muss die Session tatsächlich
+    # weiterarbeiten oder einen konkreten Nutzerblocker belegen.
+    if (
+        followthrough_pending(session_id)
+        and payload.get("stop_hook_active") is True
+        and not blocked_attested
+        and not (
+            transcript_path
+            and continuation_has_tool_activity(transcript_path)
+        )
+    ):
+        reason = (
+            "FORTSETZUNG OHNE ARBEIT: Der vorherige Stopversuch wurde wegen "
+            "selbst eingeräumter Restarbeit oder eines eigenen "
+            "Arbeitsversprechens blockiert. Seit der Stop-Fortsetzung ist "
+            "keine tatsächliche Werkzeugaktivität belegt. Führe den "
+            "unveränderten Originalauftrag jetzt selbst weiter oder delegiere "
+            "ihn erneut sinnvoll. Ein gescheiterter Workerstart beendet den "
+            "Originalauftrag nicht. Stoppe nur mit einem konkret belegten "
+            "BLOCKED_ON_USER oder nach tatsächlicher Fertigstellung."
+        )
+        if block(
+            session_id,
+            reason,
+            "Stop-Fortsetzung ohne neue Werkzeugaktivität",
+            8,
+            kind="follow-through",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
+
+    # 4. Spezifische UI-Sicherheitsregel. Allgemeine Werkzeugnutzung erzwingt
     # bewusst keinen zweiten Audit-Turn und keine formale Abschlussphrase.
+    mobile_proof_claimed = claims_mobile_ui_proof(text)
     mobile_ui_work, has_full_device_frame = (
         mobile_ui_frame_state(transcript_path, text)
-        if transcript_path
+        if transcript_path and mobile_proof_claimed
         else (False, False)
     )
-    if mobile_ui_work and not has_full_device_frame:
+    physical_device_blocker = requires_physical_device_validation(text)
+    external_eas_build_pending = waits_for_external_eas_build(text)
+    native_ios_device_proof = has_native_ios_device_proof(text)
+    if (
+        mobile_ui_work
+        and mobile_proof_claimed
+        and not has_full_device_frame
+        and not native_ios_device_proof
+        and not physical_device_blocker
+        and not external_eas_build_pending
+    ):
         reason = (
             "MOBILE-UI-PRÜFUNG UNGÜLTIG: Ein nackter 393×852-Viewport oder "
             "ein entsprechend großes Chromium-Screenshot ist kein iPhone-Nachweis. "
-            "Stelle die Expo-/iOS-App in einem vollständigen realistischen "
+            "Ein erfolgreich über Metro neu gebündelter und geladener, verbundener "
+            "iOS-Development-Build auf einem echten Gerät ist der bevorzugte "
+            "Nachweis und benötigt keinen zusätzlichen Browserrahmen. Wenn kein "
+            "solcher native Gerätebeleg vorliegt, stelle die Expo-/iOS-App in einem "
+            "vollständigen realistischen "
             "iPhone-15-Pro-Geräterahmen dar: Die App selbst bleibt exakt 393×852 "
             "CSS-Pixel groß; außen herum müssen sichtbares Gehäuse, abgerundete "
             "Displaykanten, Dynamic Island und eine iOS-Statusleiste mit Uhrzeit, "
@@ -733,15 +1523,24 @@ def main():
             "Stand im Browser, prüfe Konsole und Netzwerk und benenne den Beleg "
             "im Abschluss ausdrücklich."
         )
-        print(json.dumps({"decision": "block", "reason": reason}))
-        log(session_id, "blockiert(iphone-rahmen)", "Mobile-UI ohne Vollrahmen-Nachweis")
-        return
+        if block(
+            session_id,
+            reason,
+            "Mobile-UI ohne Vollrahmen-Nachweis",
+            3,
+            kind="iphone-frame",
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ):
+            return
 
     # Altlasten des früheren universellen Abschlussaudits nicht in neue
     # Stopversuche hineintragen.
     if audit_pending(session_id):
         clear_audit_pending(session_id)
         log(session_id, "audit-altlast-entfernt", "universeller Abschlussaudit deaktiviert")
+    if followthrough_pending(session_id):
+        clear_followthrough_pending(session_id)
+        log(session_id, "fortsetzung-erledigt", "neue Werkzeugaktivität nach Stop-Blockade")
 
     log(session_id, "durchgelassen", "keine offenen Tasks, kein Muster")
 
