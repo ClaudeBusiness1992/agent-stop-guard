@@ -94,6 +94,23 @@ class MarkerTests(unittest.TestCase):
             )
         )
 
+    def test_icons_serienreparatur_mit_eingeschobener_kopula_bleibt_offen(self):
+        self.assertTrue(
+            GUARD.has_current_scope_incomplete_marker(
+                "Der erste neue Ersatz ist fertig. Die Serienreparatur ist "
+                "damit begonnen, aber noch nicht abgeschlossen."
+            )
+        )
+
+    def test_icons_passiver_naechster_reparaturschritt_bleibt_offen(self):
+        self.assertTrue(
+            GUARD.has_current_scope_incomplete_marker(
+                "Die App-Originale sind weiterhin unangetastet. Als Nächstes "
+                "folgen die 129 motivischen Reparaturen; danach werden die "
+                "Ergebnisse integriert und gegengeprüft."
+            )
+        )
+
     def test_bewusstes_nichtaendern_und_uhrzeit_vertagung(self):
         self.assertTrue(
             GUARD.has_execution_deferral_marker(
@@ -312,6 +329,32 @@ class ToolActivityTests(unittest.TestCase):
         self.assertEqual(json.loads(output)["decision"], "block")
         self.assertTrue(GUARD.audit_pending(session_id))
 
+    def test_icons_teilabschluss_blockiert_den_ersten_stop(self):
+        session_id = "unit-icons-incomplete-stop"
+        self.addCleanup(GUARD.clear_audit_pending, session_id)
+        GUARD.clear_audit_pending(session_id)
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Bitte weiter reparieren"}],
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Die App-Originale sind weiterhin unangetastet. Als Nächstes "
+                "folgen die 129 motivischen Reparaturen; danach werden die "
+                "Ergebnisse integriert und gegengeprüft."
+            ),
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        })
+        self.assertEqual(json.loads(output)["decision"], "block")
+        self.assertTrue(GUARD.audit_pending(session_id))
+
     def test_reine_statusantwort_ohne_arbeitslauf_bleibt_erlaubt(self):
         session_id = "unit-status-answer-no-work"
         path = self.write_transcript([
@@ -325,6 +368,22 @@ class ToolActivityTests(unittest.TestCase):
             "stop_hook_active": False,
         })
         self.assertEqual(output, "")
+
+        passive_path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Was wäre danach möglich?"}],
+            }},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        passive_output = self.run_guard({
+            "session_id": f"{session_id}-passive",
+            "transcript_path": passive_path,
+            "last_assistant_message": "Als Nächstes folgen optional weitere Reparaturen.",
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        })
+        self.assertEqual(passive_output, "")
 
     def test_belegter_nutzerblocker_erlaubt_unfertigen_status(self):
         session_id = "unit-incomplete-with-real-user-blocker"

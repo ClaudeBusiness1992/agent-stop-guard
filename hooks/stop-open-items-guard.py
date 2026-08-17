@@ -65,6 +65,15 @@ OPEN_STATUS_MARKERS = re.compile(
 # Restliste antwortete und trotzdem stoppte.
 CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
     r"(\A\s*(?:nein[,;:]?\s*)?noch nicht(?:[.!]|\s*$)"
+    # Reale Icons-Lücke vom 17.08.2026: Ein eingeschobener Zustand kann die
+    # Kopula vom Abschlussprädikat trennen ("ist damit begonnen, aber noch
+    # nicht abgeschlossen"). Das ist weiterhin klar unfertiger aktueller
+    # Umfang, auch ohne ein zweites "ist" unmittelbar vor "noch nicht".
+    r"|\bnoch nicht\s+(?:vollst[aä]ndig\s+)?abgeschlossen\b"
+    # Ein aktiver Arbeitsturn endete mit "Als Nächstes folgen die 129
+    # motivischen Reparaturen". Im read-only-/Berichtsfall greift diese Regel
+    # nicht, weil main sie zusätzlich an den aktiven Ausführungsscope bindet.
+    r"|\bals n[aä]chstes\s+(?:folgt|folgen|kommt|kommen)\b"
     r"|\b(?:vorhandene|aktuelle|beauftragte)\s+unfertige\s+"
     r"(?:[äa]nderung|umsetzung)\b"
     r"|\b(?:ist|sind|wurde|wurden)\b.{0,100}\bnoch nicht\b.{0,60}\b"
