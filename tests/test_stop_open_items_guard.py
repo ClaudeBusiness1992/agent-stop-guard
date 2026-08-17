@@ -111,6 +111,20 @@ class MarkerTests(unittest.TestCase):
             )
         )
 
+    def test_icons_mengenbezogene_restarbeit_bleibt_offen(self):
+        self.assertTrue(
+            GUARD.has_current_scope_incomplete_marker(
+                "Damit sind 217 von 316 betroffenen Icons vorbereitet. "
+                "99 Motivkorrekturen sind noch offen."
+            )
+        )
+        self.assertTrue(
+            GUARD.has_current_scope_incomplete_marker(
+                "Aktuell sind 202 Korrekturen vorbereitet. "
+                "Die übrigen 114 Motive folgen noch."
+            )
+        )
+
     def test_bewusstes_nichtaendern_und_uhrzeit_vertagung(self):
         self.assertTrue(
             GUARD.has_execution_deferral_marker(
@@ -354,6 +368,38 @@ class ToolActivityTests(unittest.TestCase):
         })
         self.assertEqual(json.loads(output)["decision"], "block")
         self.assertTrue(GUARD.audit_pending(session_id))
+
+    def test_icons_fortsetzung_darf_nicht_nach_einer_weiteren_charge_stoppen(self):
+        session_id = "unit-icons-multi-batch-continuation"
+        self.addCleanup(GUARD.clear_audit_pending, session_id)
+        self.addCleanup(GUARD.clear_followthrough_pending, session_id)
+        GUARD.set_audit_pending(session_id)
+        GUARD.set_followthrough_pending(session_id)
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Bitte weiter reparieren"}],
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "<hook_prompt>weiter</hook_prompt>"}],
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "30 neue Motivkorrekturen sind fertig. Damit sind 217 von 316 "
+                "Icons vorbereitet. 99 Motivkorrekturen sind noch offen."
+            ),
+            "hook_event_name": "Stop",
+            "stop_hook_active": True,
+        })
+        self.assertEqual(json.loads(output)["decision"], "block")
+        self.assertTrue(GUARD.audit_pending(session_id))
+        self.assertTrue(GUARD.followthrough_pending(session_id))
 
     def test_reine_statusantwort_ohne_arbeitslauf_bleibt_erlaubt(self):
         session_id = "unit-status-answer-no-work"

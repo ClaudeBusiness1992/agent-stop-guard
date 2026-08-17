@@ -74,6 +74,15 @@ CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
     # motivischen Reparaturen". Im read-only-/Berichtsfall greift diese Regel
     # nicht, weil main sie zusätzlich an den aktiven Ausführungsscope bindet.
     r"|\bals n[aä]chstes\s+(?:folgt|folgen|kommt|kommen)\b"
+    # Reale Chargenarbeit vom 17.08.2026: Nach einer vom Hook erzwungenen
+    # Fortsetzung endete die Icon-Session erneut mit "99 Motivkorrekturen sind
+    # noch offen". Das allgemeine Offen-Muster reichte hier nicht, weil die
+    # harte aktuelle-Scope-Regel nur eine engere Teilmenge auswertet.
+    r"|\b[1-9]\d*\s+[a-zäöüß][a-zäöüß0-9_-]*(?:\s+[a-zäöüß][a-zäöüß0-9_-]*){0,3}"
+    r"\s+(?:ist|sind|bleibt|bleiben)\s+noch\s+offen\b"
+    r"|\bdie\s+(?:[üu]brigen|restlichen|verbleibenden)\s+[1-9]\d*\s+"
+    r"[a-zäöüß][a-zäöüß0-9_-]*(?:\s+[a-zäöüß][a-zäöüß0-9_-]*){0,3}\s+"
+    r"(?:folgt|folgen|kommt|kommen|steht|stehen)\s+noch\b"
     r"|\b(?:vorhandene|aktuelle|beauftragte)\s+unfertige\s+"
     r"(?:[äa]nderung|umsetzung)\b"
     r"|\b(?:ist|sind|wurde|wurden)\b.{0,100}\bnoch nicht\b.{0,60}\b"
