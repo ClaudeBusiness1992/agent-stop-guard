@@ -118,6 +118,15 @@ class MarkerTests(unittest.TestCase):
                 "99 Motivkorrekturen sind noch offen."
             )
         )
+
+    def test_fremde_icon_session_ist_keine_restarbeit_des_guard_fixes(self):
+        text = (
+            "Der Stop-Guard ist repariert und installiert. Die Icons selbst sind "
+            "dadurch noch nicht fertig: In jener Session stehen weiterhin 99 "
+            "Motivkorrekturen und die Gegenprüfung aus."
+        )
+        self.assertFalse(GUARD.has_current_scope_incomplete_marker(text))
+        self.assertFalse(GUARD.has_open_status_marker(text))
         self.assertTrue(
             GUARD.has_current_scope_incomplete_marker(
                 "Aktuell sind 202 Korrekturen vorbereitet. "
@@ -400,6 +409,39 @@ class ToolActivityTests(unittest.TestCase):
         self.assertEqual(json.loads(output)["decision"], "block")
         self.assertTrue(GUARD.audit_pending(session_id))
         self.assertTrue(GUARD.followthrough_pending(session_id))
+
+    def test_abgeschlossener_guard_fix_darf_fremdsitzungsstatus_nennen(self):
+        session_id = "unit-foreign-icon-session-report"
+        self.addCleanup(GUARD.clear_audit_pending, session_id)
+        self.addCleanup(GUARD.clear_followthrough_pending, session_id)
+        GUARD.set_audit_pending(session_id)
+        GUARD.set_followthrough_pending(session_id)
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Fixe den Stop-Hook"}],
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "<hook_prompt>weiter</hook_prompt>"}],
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+        ])
+        output = self.run_guard({
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Der Stop-Guard ist repariert, installiert und verifiziert. "
+                "Die Icons sind dadurch noch nicht fertig: In jener Session "
+                "stehen weiterhin 99 Motivkorrekturen aus.\n\n"
+                "AUFTRAG VOLLSTÄNDIG ERLEDIGT"
+            ),
+            "hook_event_name": "Stop",
+            "stop_hook_active": True,
+        })
+        self.assertEqual(output, "")
+        self.assertFalse(GUARD.audit_pending(session_id))
+        self.assertFalse(GUARD.followthrough_pending(session_id))
 
     def test_reine_statusantwort_ohne_arbeitslauf_bleibt_erlaubt(self):
         session_id = "unit-status-answer-no-work"

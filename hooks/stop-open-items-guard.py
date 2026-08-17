@@ -202,6 +202,26 @@ QUOTED_EXAMPLES = re.compile(
     r"|\"[^„“”\"\n]*[\"”]"
 )
 
+FOREIGN_SCOPE_REFERENCE = re.compile(
+    r"\b(?:in|bei)\s+(?:jener|einer\s+anderen|der\s+anderen|fremden)\s+"
+    r"(?:[a-zäöüß0-9_-]+\s+){0,3}(?:session|sitzung|pane|panel|projekt)\b",
+    re.IGNORECASE,
+)
+
+
+def without_foreign_scope_segments(text):
+    """Entfernt nur Sätze, die ausdrücklich eine fremde Arbeitssitzung melden.
+
+    Der Kontaktagent darf nach einer abgeschlossenen Guard-Reparatur den noch
+    offenen Stand der beobachteten Fremdsitzung nennen. Dieser Status gehört
+    nicht automatisch zum Arbeitsumfang des aktuellen Turns.
+    """
+    segments = re.split(r"(?<=[.!?])\s+|\n{2,}", str(text or ""))
+    return "\n".join(
+        segment for segment in segments
+        if segment and not FOREIGN_SCOPE_REFERENCE.search(segment)
+    )
+
 
 def has_open_work_marker(text):
     """Erkennt Statuswidersprüche und echte eigene Arbeitsankündigungen."""
@@ -213,12 +233,12 @@ def has_open_work_marker(text):
 
 
 def has_open_status_marker(text):
-    without_examples = QUOTED_EXAMPLES.sub("", text)
+    without_examples = QUOTED_EXAMPLES.sub("", without_foreign_scope_segments(text))
     return OPEN_STATUS_MARKERS.search(without_examples) is not None
 
 
 def has_current_scope_incomplete_marker(text):
-    without_examples = QUOTED_EXAMPLES.sub("", text)
+    without_examples = QUOTED_EXAMPLES.sub("", without_foreign_scope_segments(text))
     return CURRENT_SCOPE_INCOMPLETE_MARKERS.search(without_examples) is not None
 
 
