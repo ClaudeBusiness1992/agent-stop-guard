@@ -4,7 +4,107 @@
 // Empfehlungen nicht.
 import type { Plugin } from "@opencode-ai/plugin"
 
-const MAX_BLOCKS = 8
+const MAX_BLOCKS = 1
+
+const DIALOGUE_ROUND_ENABLE = new RegExp(
+  [
+    "(?:geh(?:e)?|mach(?:e)?|klär(?:e)?|erklär(?:e)?)\\b.{0,80}\\b(?:jeden\\s+punkt\\s+einzeln|punkt\\s+f[üu]r\\s+punkt|frage\\s+f[üu]r\\s+frage)",
+    "(?:immer\\s+)?(?:nur\\s+)?eine\\s+frage\\s+(?:zur\\s+zeit|pro\\s+(?:nachricht|runde)|nach\\s+der\\s+anderen)",
+    "nicht\\s+(?:so\\s+)?viele\\s+(?:punkte|fragen)\\s+auf\\s+einmal",
+    "(?:starte|beginne|mach(?:e)?)\\b.{0,60}\\bfragerunde",
+    "fragerunde\\b.{0,40}\\b(?:starten|beginnen|machen)",
+  ].join("|"),
+  "i",
+)
+
+const DIALOGUE_ROUND_DISABLE = new RegExp(
+  [
+    "(?:beende|stoppe)\\s+(?:jetzt\\s+)?(?:die\\s+)?fragerunde",
+    "keine\\s+weiteren\\s+fragen",
+    "ohne\\s+(?:weitere\\s+)?r[üu]ckfragen",
+    "(?:mach|erledige|bearbeite|arbeite)\\b.{0,60}\\b(?:alles|den\\s+rest)\\s+(?:auf\\s+einmal|selbstst[aä]ndig|durch|ab)",
+    "entscheide\\s+(?:den\\s+rest\\s+)?selbst",
+  ].join("|"),
+  "i",
+)
+
+const DIALOGUE_TASK_RESET = new RegExp(
+  [
+    "(?:neuer|anderer|nächster|naechster)\\s+(?:auftrag|aufgabe|thema|scope)",
+    "(?:alle|sämtliche|saemtliche|diese|die)\\b.{0,100}\\b(?:müssen|muessen|sollen)\\b.{0,100}\\b(?:integriert|umgesetzt|behoben|repariert|gefixt|geprüft|geprueft|abgeschlossen|fertig)",
+    "^\\s*(?:implementiere|integriere|repariere|behebe|fixe|baue|erstelle|ändere|aendere|prüfe|pruefe|analysiere|übernimm|uebernimm|arbeite|sorge)\\b",
+  ].join("|"),
+  "is",
+)
+
+// Auswahloptionen können nach der Frage stehen; die Frage muss nicht enden.
+// Ein beliebiges Fragezeichen in einem Zitat oder Statusbericht genügt nicht.
+const DIRECT_QUESTION = new RegExp(
+  "(?:^|[\\n.!]\\s*)(?:" +
+    "(?:was|wer|wen|wem|welch\\w*|wie|warum|weshalb|wo|wohin|woher|wann|wieviel|wie\\s+viel|wie\\s+lange)\\b" +
+    "|(?:soll\\w*|darf\\w*|kann\\w*|könn\\w*|koenn\\w*|möcht\\w*|moecht\\w*|will\\w*|ist|sind|hat|haben|braucht|passt|gilt|geht|funktioniert|should|shall|can|could|would|do|does|is|are|has|have|what|which|how|why|where|when|who)\\b" +
+    ")[^?\\n]{0,500}\\?",
+  "im",
+)
+const QUOTED_DIRECT_QUESTION_CONTEXT = new RegExp(
+  "\\b(?:beantworte|entscheide|wähle|waehle|antworte)\\b[^?\\n]{0,120}" +
+    "(?:was|wer|wen|wem|welch\\w*|wie|warum|weshalb|wo|wann|soll\\w*|darf\\w*|kann\\w*|möcht\\w*|moecht\\w*|will\\w*|ist|sind)\\b" +
+    "[^?\\n]{0,300}\\?",
+  "im",
+)
+
+const USER_PROMISES_FUTURE_INPUT = new RegExp(
+  "(?:" +
+    "(?=.*\\b(?:gleich|sobald|nachher|bald)\\b)" +
+    "(?=.*\\b(?:workflow|entwurf|bereich|text|datei|pfad|info(?:rmation)?|" +
+    "input|antwort)\\b)" +
+    "(?=.*\\b(?:schick\\w*|send\\w*|liefer\\w*|bekomm\\w*|reich\\w*|geb\\w*)\\b)" +
+    "|(?=.*\\b(?:lasse|lass)\\b.{0,80}\\b(?:testen|pr[üu]fen|gegenchecken)\\b)" +
+    "(?=.*\\b(?:melde\\s+mich|gebe\\s+bescheid|schicke\\s+das\\s+ergebnis)\\b)" +
+    ")",
+  "is",
+)
+
+const DIALOGUE_RESOLUTION_MARKERS = new RegExp(
+  "\\b(?:fragerunde|entscheidung(?:en)?|punkte?)\\b.{0,100}\\b" +
+    "(?:abgeschlossen|gekl[äa]rt|beantwortet|zur\\s+(?:getrennten\\s+)?" +
+    "umsetzung\\s+bereit)\\b|\\bkeine\\s+weitere\\s+frage\\b",
+  "is",
+)
+
+function userPromisesFutureInput(text: string): boolean {
+  return USER_PROMISES_FUTURE_INPUT.test(text)
+}
+
+const IMAGE_TASK_PROMPT = new RegExp(
+  "(?=.*\\b(?:bild\\w*|foto\\w*|screenshot\\w*|grafik\\w*|image\\w*)\\b)" +
+    "(?=.*\\b(?:siehst?|sehen|ansehen|schau\\w*|guck\\w*|pr[üu]f\\w*|" +
+    "analys\\w*|beschreib\\w*|erkenn\\w*|bewert\\w*)\\b)",
+  "is",
+)
+
+const IMAGE_CAPABILITY_META_PROMPT = new RegExp(
+  "(?=.*\\bmodell\\w*\\b)(?=.*\\b(?:unterst[üu]tz\\w*|f[äa]hig\\w*|" +
+    "capabilit\\w*|kann\\s+(?:das\\s+)?modell)\\b)",
+  "is",
+)
+
+const IMAGE_CAPABILITY_DEFLECTION = new RegExp(
+  "(?:\\b(?:kann|konnte)\\b.{0,100}\\bbild\\w*\\b.{0,100}\\bnicht\\b" +
+    ".{0,60}\\b(?:ansehen|sehen|pr[üu]fen|analysieren|auswerten|verarbeiten)\\b" +
+    "|\\bmodell\\w*\\b.{0,120}\\bunterst[üu]tzt\\b.{0,60}\\bkeine?\\b" +
+    ".{0,40}\\bbild(?:er|[- ]?eingaben?)?\\b)" +
+    "(?=.*\\b(?:multimodal\\w*|router\\w*|bild[- ]?eingab\\w*|vision\\w*)\\b)",
+  "is",
+)
+
+function needsMultimodalHandoff(userText: string, assistantText: string): boolean {
+  return (
+    IMAGE_TASK_PROMPT.test(userText) &&
+    !IMAGE_CAPABILITY_META_PROMPT.test(userText) &&
+    IMAGE_CAPABILITY_DEFLECTION.test(assistantText)
+  )
+}
 
 const OPEN_STATUS_MARKERS = new RegExp(
   [
@@ -57,20 +157,20 @@ const LOCAL_UNFINISHED_MARKERS = new RegExp(
 
 const QUOTED_EXAMPLES = /`[^`\n]*`|„[^“\n]*“|“[^”\n]*”|"[^"\n]*"/g
 const FULL_COMPLETION = /(?:^|\n)\s*AUFTRAG VOLLSTÄNDIG ERLEDIGT\s*(?:$|\n)/i
-const BLOCKED_LINE = /(?:^|\n)\s*BLOCKED_ON_USER:\s*([^\n]*)/i
+const BLOCKED_LINE = /(?:^|\n)\s*(?:[-*•]\s*)?BLOCKED_ON_USER:\s*([^\n]*)/i
 const NON_SPECIFIC_BLOCKER = /^(?:sp[aä]ter|unbekannt|unklar|offen|todo|tbd|n\/?a|keine ahnung|wartet)[.!\s]*$/i
 
-export function withoutQuotedExamples(text: string): string {
+function withoutQuotedExamples(text: string): string {
   return text.replace(QUOTED_EXAMPLES, "")
 }
 
-export function blockedOnUserDetail(text: string): string | undefined {
+function blockedOnUserDetail(text: string): string | undefined {
   const detail = BLOCKED_LINE.exec(text)?.[1]?.trim()
   if (!detail || detail.length < 12 || NON_SPECIFIC_BLOCKER.test(detail)) return
   return detail
 }
 
-export function shouldContinueFromText(text: string): boolean {
+function shouldContinueFromText(text: string): boolean {
   const plain = withoutQuotedExamples(text)
   const blocked = blockedOnUserDetail(plain) !== undefined
   return (
@@ -104,26 +204,50 @@ const CONTINUE_PROMPT =
   "Scope noch Schreibrechte. Stoppe erst nach tatsächlicher Umsetzung und Prüfung " +
   "oder benenne einen konkreten externen Blocker mit BLOCKED_ON_USER und Beleg."
 
-const blockCounts = new Map<string, number>()
+type BlockState = { fingerprint: string; count: number }
+const blockCounts = new Map<string, BlockState>()
+const skipNextIdle = new Set<string>()
 
 export const StopOpenItemsGuard: Plugin = async ({ client }) => ({
   event: async ({ event }) => {
+    if (event.type === "session.error") {
+      const properties = event.properties as any
+      if (properties?.error?.name === "MessageAbortedError" && properties.sessionID) {
+        skipNextIdle.add(properties.sessionID)
+      }
+      return
+    }
     if (event.type !== "session.idle") return
     const sessionID = event.properties.sessionID
     if (!sessionID) return
-
-    const count = blockCounts.get(sessionID) ?? 0
-    if (count >= MAX_BLOCKS) return
+    if (skipNextIdle.delete(sessionID)) {
+      blockCounts.delete(sessionID)
+      return
+    }
 
     let text = ""
+    let lastUserText = ""
+    let dialogueRound = false
     try {
       const res = await client.session.messages({ path: { id: sessionID } })
       for (const msg of res.data ?? []) {
-        if (msg.info?.role !== "assistant") continue
         const parts = (msg.parts ?? [])
           .filter((part: any) => part.type === "text" && typeof part.text === "string")
           .map((part: any) => part.text)
-        if (parts.length > 0) text = parts.join("\n")
+        if (parts.length === 0) continue
+        const messageText = parts.join("\n")
+        if (msg.info?.role === "assistant") {
+          text = messageText
+          continue
+        }
+        if (
+          msg.info?.role !== "user" ||
+          messageText.trimStart().startsWith("[stop-open-items-guard]")
+        ) continue
+        lastUserText = messageText
+        if (DIALOGUE_ROUND_DISABLE.test(messageText)) dialogueRound = false
+        else if (DIALOGUE_ROUND_ENABLE.test(messageText)) dialogueRound = true
+        else if (dialogueRound && DIALOGUE_TASK_RESET.test(messageText)) dialogueRound = false
       }
     } catch {
       return
@@ -140,8 +264,28 @@ export const StopOpenItemsGuard: Plugin = async ({ client }) => ({
     const actionable = actionableTodos(todos)
     const parked = todos.filter(todoBlockedOnUser)
     let prompt: string | undefined
+    let promptKind = ""
 
-    if (actionable.length > 0) {
+    if (needsMultimodalHandoff(lastUserText, text) && blockedOnUserDetail(text) === undefined) {
+      prompt =
+        "[stop-open-items-guard] MULTIMODALE ÜBERGABE ERFORDERLICH: Nick hat " +
+        "einen konkreten Bildauftrag gestellt und deine Antwort bestätigt nur " +
+        "die Grenze des aktuell gepinnten Modells. Frage nicht erneut, was mit " +
+        "dem Bild geschehen soll. Behalte den Nutzerkontakt, lies das aktuelle " +
+        "Router-Schema und delegiere den unveränderten Auftrag taskgebunden mit " +
+        "Bild- oder Screenshot-Modalität an ein freigegebenes multimodales Modell. " +
+        "Nur ein konkret belegter Provider-, Daten-, Sandbox- oder " +
+        "Berechtigungsfehler darf die Übergabe stoppen."
+      promptKind = "multimodal-handoff"
+    } else if (
+      QUOTED_DIRECT_QUESTION_CONTEXT.test(text) ||
+      DIRECT_QUESTION.test(withoutQuotedExamples(text))
+    ) {
+      // Eine echte aktuelle Frage wartet auf Nick und wird nicht von einer
+      // älteren Todo-Anzeige in eine künstliche Fortsetzung umgedeutet.
+      blockCounts.delete(sessionID)
+      return
+    } else if (actionable.length > 0) {
       const listing = actionable
         .slice(0, 12)
         .map((todo) => `- [${todo.status}] ${todo.content ?? todo.id ?? "Aufgabe"}`)
@@ -151,13 +295,22 @@ export const StopOpenItemsGuard: Plugin = async ({ client }) => ({
         `OpenCode-Aufgabe(n) sind offen:\n${listing}\n\nArbeite sie jetzt ab und ` +
         "aktualisiere die Todo-Liste. Nur ein wirklich externer Blocker darf als " +
         "pending mit 'BLOCKED_ON_USER: <konkreter Input und Beleg>' verbleiben."
+      promptKind = "todos"
     } else if (parked.length > 0 && blockedOnUserDetail(text) === undefined) {
       prompt =
         "[stop-open-items-guard] Die OpenCode-Todo-Liste enthält geparkte " +
         "BLOCKED_ON_USER-Punkte. Benenne im Abschluss den konkret benötigten " +
         "Nutzerinput samt Beleg; ein Platzhalter wie 'später' genügt nicht."
+      promptKind = "parked"
+    } else if (
+      dialogueRound &&
+      (userPromisesFutureInput(lastUserText) || DIALOGUE_RESOLUTION_MARKERS.test(text))
+    ) {
+      blockCounts.delete(sessionID)
+      return
     } else if (text && shouldContinueFromText(text)) {
       prompt = CONTINUE_PROMPT
+      promptKind = "text"
     }
 
     if (!prompt) {
@@ -165,7 +318,11 @@ export const StopOpenItemsGuard: Plugin = async ({ client }) => ({
       return
     }
 
-    blockCounts.set(sessionID, count + 1)
+    const fingerprint = `${promptKind}\u0000${lastUserText}`
+    const previous = blockCounts.get(sessionID)
+    const count = previous?.fingerprint === fingerprint ? previous.count : 0
+    if (count >= MAX_BLOCKS) return
+    blockCounts.set(sessionID, { fingerprint, count: count + 1 })
     try {
       await client.session.promptAsync({
         path: { id: sessionID },

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -88,6 +89,28 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(
             INSTALLER.contains_command(settings, "ask-user-open-items-guard.py")
         )
+
+    def test_install_resets_managed_file_modes(self):
+        INSTALLER.install({"claude", "opencode"}, home=self.home)
+        hook = self.home / ".local" / "share" / "agent-stop-guard" / "stop-open-items-guard.py"
+        plugin = self.home / ".config" / "opencode" / "plugins" / "stop-open-items-guard.ts"
+        hook.chmod(0o777)
+        plugin.chmod(0o666)
+        INSTALLER.install({"claude", "opencode"}, home=self.home)
+        self.assertEqual(hook.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(plugin.stat().st_mode & 0o777, 0o644)
+
+    def test_install_replaces_target_symlink_without_touching_its_victim(self):
+        install_root = self.home / ".local" / "share" / "agent-stop-guard"
+        install_root.mkdir(parents=True)
+        victim = self.home / "victim"
+        victim.write_text("unchanged", encoding="utf-8")
+        target = install_root / "stop-open-items-guard.py"
+        os.symlink(victim, target)
+        INSTALLER.install({"codex"}, home=self.home)
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
 
 
 if __name__ == "__main__":

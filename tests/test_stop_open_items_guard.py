@@ -293,7 +293,7 @@ class ToolActivityTests(unittest.TestCase):
             ],
         )
 
-    def test_juengster_codex_plan_ersetzt_den_vorherigen(self):
+    def test_juengster_codex_plan_ersetzt_ausgelassenen_altpunkt(self):
         path = self.write_transcript([
             {"type": "response_item", "payload": {
                 "type": "custom_tool_call", "name": "exec",

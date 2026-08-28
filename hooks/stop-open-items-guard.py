@@ -12,10 +12,11 @@ import os
 import re
 import sys
 
-# Budget für die weiche Textregel. Die harte Task-Regel hat ein eigenes,
-# deutlich größeres Budget (siehe main) - offene Arbeit wiegt schwerer als
-# eine unglücklich formulierte Antwort.
-MAX_BLOCKS = 8
+# Budget für die weiche Textregel. Ein unsicheres Sprachmuster darf genau eine
+# Korrektur anfordern, aber niemals eine Folge umformulierter Abschlussberichte
+# erzwingen. Harte strukturierte Tasks und Pläne haben eigene Budgets.
+MAX_BLOCKS = 1
+MAX_STRUCTURED_BLOCKS = 1
 STATE_TTL_DAYS = 30
 MAX_LOG_BYTES = 1024 * 1024
 LOG_RETAIN_BYTES = 512 * 1024
@@ -45,15 +46,15 @@ OPEN_STATUS_MARKERS = re.compile(
     r"|(?:fehlt|fehlen|bleibt|bleiben) noch\b"
     r"|noch (?:lokal(?:e[rnms]?)?\s+)?umzusetzen\b"
     r"|\bnoch nichts\b.{0,80}\b"
-    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet)\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet|gefixt|gel[öo]st)\b"
     r"|\b(?:wurde|wurden|ist|sind)\b.{0,100}\b(?:noch\s+)?nicht\b.{0,50}\b"
-    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|ver[öo]ffentlicht)\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|ver[öo]ffentlicht|gefixt|gel[öo]st|verifiziert|abgeschlossen)\b"
     r"|konnte(?:n)? .{0,120}\bnoch nicht\b"
     r"|fertig (?:sind|ist) nur\b"
     r"|(?:wird|werden)\b.{0,80}\bnoch\b.{0,60}"
-    r"(?:umgesetzt|konsolidiert|gebaut|implementiert|gepr[üu]ft|getestet)\b"
+    r"(?:umgesetzt|konsolidiert|gebaut|implementiert|gepr[üu]ft|getestet|abgeschlossen)\b"
     r"|remaining (?:tasks|items|work)|still open"
-    r"|not yet (done|complete|implemented)"
+    r"|not yet (?:done|complete|implemented|fixed|resolved|verified)"
     r")",
     re.IGNORECASE,
 )
@@ -64,12 +65,12 @@ OPEN_STATUS_MARKERS = re.compile(
 # Session auf die Kontrollfrage "alle Aufgaben erledigt?" mit "Nein" und einer
 # Restliste antwortete und trotzdem stoppte.
 CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
-    r"(\A\s*(?:nein[,;:]?\s*)?noch nicht(?:[.!]|\s*$)"
+    r"(\A\s*(?:nein[,;:]?\s*)?noch nicht(?:\s+(?:alles|vollst[aä]ndig|ganz|fertig|bereit|abgeschlossen|erledigt|umgesetzt|behoben|gefixt|gel[öo]st|sauber|passend|durch))?(?:[.!]|\s*$)"
     # Reale Icons-Lücke vom 17.08.2026: Ein eingeschobener Zustand kann die
     # Kopula vom Abschlussprädikat trennen ("ist damit begonnen, aber noch
     # nicht abgeschlossen"). Das ist weiterhin klar unfertiger aktueller
     # Umfang, auch ohne ein zweites "ist" unmittelbar vor "noch nicht".
-    r"|\bnoch nicht\s+(?:vollst[aä]ndig\s+)?abgeschlossen\b"
+    r"|\bnoch nicht\s+(?:vollst[aä]ndig|ganz|fertig|bereit|abgeschlossen|erledigt|umgesetzt|behoben|gefixt|gel[öo]st|sauber|passend|durch)\b"
     # Ein aktiver Arbeitsturn endete mit "Als Nächstes folgen die 129
     # motivischen Reparaturen". Im read-only-/Berichtsfall greift diese Regel
     # nicht, weil main sie zusätzlich an den aktiven Ausführungsscope bindet.
@@ -86,7 +87,12 @@ CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
     r"|\b(?:vorhandene|aktuelle|beauftragte)\s+unfertige\s+"
     r"(?:[äa]nderung|umsetzung)\b"
     r"|\b(?:ist|sind|wurde|wurden)\b.{0,100}\bnoch nicht\b.{0,60}\b"
-    r"(?:implementiert|einklappbar|separat\s+erkannt|umgesetzt|fertig)\b"
+    r"(?:implementiert|einklappbar|separat\s+erkannt|umgesetzt|fertig|verifiziert|gepr[üu]ft|getestet|behoben|gefixt|gel[öo]st|abgeschlossen|korrigiert|geladen|eingerichtet|[üu]bernommen|eingebunden|bereinigt|migriert|gebaut|beendet|funktionsf[äa]hig|sauber|online|erreichbar|verbunden)\b"
+    r"|\bnoch nicht\b.{0,40}\b(?:sauber|vollst[aä]ndig|richtig|korrekt)\s+(?:verifiziert|gepr[üu]ft|getestet|implementiert|umgesetzt|behoben|gefixt|gel[öo]st|konfiguriert|eingebettet|abgeschlossen)\b"
+    r"|\b(?:[üu]bernimmt|[üu]bernommen|funktioniert|l[äa]dt|klappt)\b.{0,60}\bnoch nicht\b"
+    r"|\b(?:noch|immer noch)\s+(?:ein\s+)?(?:restkonflikt|restproblem|restfehler|restpunkt|konflikt|problem|fehler|bug)\b"
+    r"|\b(?:export|build|render\w*|test\w*)\s+(?:l[äa]uft|dauert|braucht)\s+noch\b"
+    r"|\bbraucht gerade ungew[öo]hnlich lange\b"
     r"|\b(?:nein[,;:]?\s*)?noch nicht alles\b"
     r"|noch nicht (?:alle|s[aä]mtliche|vollst[aä]ndig|komplett)\s+"
     r"(?:gesamt)?aufgaben\b"
@@ -99,31 +105,185 @@ CURRENT_SCOPE_INCOMPLETE_MARKERS = re.compile(
     r"|\bbleibt(?: weiterhin)?\b.{0,100}\b(?:ein|der|dieser|separater)\s+"
     r"offene[rnms]?\s+(?:punkt|aufgabe|arbeit)\b"
     r"|\bnoch nichts\b.{0,80}\b"
-    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet)\b"
+    r"(?:repariert|behoben|umgesetzt|ge[äa]ndert|erledigt|getestet|gefixt|gel[öo]st)\b"
     r"|\b(?:fix|auftrag|aufgabe|reparatur|umsetzung|[äa]nderung)\b"
     r".{0,100}\b(?:wurde|wurden|ist|sind)\b.{0,40}\b(?:noch\s+)?nicht\b"
-    r".{0,50}\b(?:repariert|behoben|umgesetzt|erledigt|ver[öo]ffentlicht)\b)",
+    r".{0,50}\b(?:repariert|behoben|umgesetzt|erledigt|ver[öo]ffentlicht|gefixt|gel[öo]st)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 
 COMPLETION_CHECK_PROMPT = re.compile(
     r"(?:\balles\b.{0,50}\b"
-    r"(?:erledigt|fertig|abgeschlossen|umgesetzt)\b"
+    r"(?:erledigt|fertig|abgeschlossen|umgesetzt|behoben|gefixt|gel[öo]st)\b"
     r"|\b(?:alle|s[aä]mtliche)\b.{0,50}\b"
-    r"(?:erledigt|fertig|abgeschlossen|umgesetzt)\b"
-    r"|\b(?:ist|sind)\b.{0,40}\b(?:alles|alle)\b.{0,40}"
-    r"\b(?:fertig|erledigt|abgeschlossen|umgesetzt)\b"
+    r"(?:erledigt|fertig|abgeschlossen|umgesetzt|behoben|gefixt|gel[öo]st)\b"
+    r"|\b(?:ist|sind)\b.{0,40}\b(?:alles|alle|das|der|die|es)\b.{0,40}"
+    r"\b(?:fertig|erledigt|abgeschlossen|umgesetzt|behoben|gefixt|gel[öo]st|bereit)\b"
+    r"|\bhast\s*(?:du)?\b.{0,50}\b(?:gefixt|gefixed|behoben|gel[öo]st|repariert|erledigt|fertig|gemacht|abgeschlossen)\b"
+    r"|\bbist\s*(?:du)?\b.{0,40}\b(?:fertig|durch|bereit|soweit)\b"
+    r"|\b(?:wie weit bist du|wie ist der stand|wie sieht es aus|was ist der status|wie ist der status)\b"
+    r"|\bkann\s*(?:ich|man)\b.{0,60}\b(?:weiterarbeiten|testen|sehen|ausprobieren|starten)\b"
+    r"|\b(?:funktioniert|geht|l[äa]uft|klappt|tut)\s+(?:es|das)\s+(?:jetzt|schon)\b"
+    r"|\b(?:fixt|machst)\s*du\b.{0,50}\b(?:das|fertig|weiter)\b"
+    r"|\b(?:mach|machst du)\s+(?:das|bitte|deine aufgaben|deinen teil)?\s*(?:noch\s+)?fertig\b"
+    r"|\bdu sollst das fertig machen\b"
+    r"|\bkannst\s+(?:du\s+)?weiter\s*machen\b"
+    r"|\bmach\s+(?:bitte\s+)?weiter\b"
     r"|\bnoch\b.{0,40}\b(?:aufgaben|punkte|arbeit)\b.{0,30}\boffen\b"
-    r"|\b(?:fertig|erledigt|abgeschlossen|umgesetzt)\s*\?\s*$)",
+    r"|\b(?:fertig|erledigt|abgeschlossen|umgesetzt|behoben|gefixt|gel[öo]st)\s*\?\s*$)",
     re.IGNORECASE | re.DOTALL,
 )
 
 READ_ONLY_SCOPE_PROMPT = re.compile(
     r"\b(?:read[- ]?only|nur\s+(?:pr[üu]fen|analysieren|bewerten|ansehen|"
     r"nachsehen)|audit(?:ieren)?|review(?:en)?|analyse|bestandsaufnahme|"
-    r"keine\s+(?:[äa]nderungen|umsetzung)|nichts\s+(?:[äa]ndern|umsetzen))\b",
-    re.IGNORECASE,
+    r"keine\s+(?:[äa]nderungen|umsetzung|werkzeuge)|nichts\s+"
+    r"(?:[äa]ndern|umsetzen)|(?:antworte|antwort)\b.{0,80}\b"
+    r"(?:ausschlie[ßs]lich|nur)\b.{0,40}\bstatus|"
+    r"(?:nutze|verwende|starte)\b.{0,60}\bkeine\s+"
+    r"(?:werkzeuge|agents?|prozesse))\b",
+    re.IGNORECASE | re.DOTALL,
 )
+
+USER_EXECUTION_REQUEST = re.compile(
+    r"\b(?:repariere|behebe|fixe|implementiere|integriere|baue|erstelle|"
+    r"[äa]ndere|setze\s+um|arbeite\b.{0,40}\b(?:ab|weiter)|mach(?:e)?\b"
+    r".{0,40}\b(?:fertig|weiter)|sorge\b.{0,80}\bdaf[üu]r)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Eine ausdrücklich gewünschte Fragerunde ist ein dialogischer Auftrag: Der
+# Agent erklärt genau einen Punkt, stellt genau eine Frage und wartet dann auf
+# die Antwort. Ein Stop an dieser Stelle ist kein Abbruch offener Arbeit.
+DIALOGUE_ROUND_ENABLE = re.compile(
+    r"\b(?:"
+    r"(?:geh(?:e)?|mach(?:e)?|klär(?:e)?|erklär(?:e)?)\b.{0,80}\b"
+    r"(?:jeden\s+punkt\s+einzeln|punkt\s+f[üu]r\s+punkt|frage\s+f[üu]r\s+frage)"
+    r"|(?:immer\s+)?(?:nur\s+)?eine\s+frage\s+(?:zur\s+zeit|pro\s+(?:nachricht|runde)|nach\s+der\s+anderen)"
+    r"|nicht\s+(?:so\s+)?viele\s+(?:punkte|fragen)\s+auf\s+einmal"
+    r"|(?:starte|beginne|mach(?:e)?)\b.{0,60}\bfragerunde"
+    r"|fragerunde\b.{0,40}\b(?:starten|beginnen|machen)"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+DIALOGUE_ROUND_DISABLE = re.compile(
+    r"\b(?:"
+    r"(?:beende|stoppe)\s+(?:jetzt\s+)?(?:die\s+)?fragerunde"
+    r"|keine\s+weiteren\s+fragen"
+    r"|ohne\s+(?:weitere\s+)?r[üu]ckfragen"
+    r"|(?:mach|erledige|bearbeite|arbeite)\b.{0,60}\b(?:alles|den\s+rest)\s+(?:auf\s+einmal|selbstst[aä]ndig|durch|ab)"
+    r"|entscheide\s+(?:den\s+rest\s+)?selbst"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+# Eine Fragerunde ist an den laufenden Dialogauftrag gebunden, nicht an die
+# gesamte Session. Ein späterer eigenständiger Arbeitsauftrag beendet sie auch
+# dann, wenn Nick die alte Runde nicht mit einer besonderen Formel schließt.
+# Kurze Antworten wie "A", "ja" oder "vier Stunden" treffen diese enge Regel
+# bewusst nicht.
+DIALOGUE_TASK_RESET = re.compile(
+    r"(?:\b(?:neuer|anderer|nächster|naechster)\s+"
+    r"(?:auftrag|aufgabe|thema|scope)\b"
+    r"|\b(?:alle|sämtliche|saemtliche|diese|die)\b.{0,100}\b"
+    r"(?:müssen|muessen|sollen)\b.{0,100}\b"
+    r"(?:integriert|umgesetzt|behoben|repariert|gefixt|geprüft|geprueft|"
+    r"abgeschlossen|fertig)\b"
+    r"|\bbitte\s+fix(?:en|e|t)?\b"
+    r"|^\s*(?:bitte\s+)?(?:implementiere|integriere|repariere|behebe|"
+    r"fix(?:e|en|t)?|baue|erstelle|"
+    r"ändere|aendere|prüfe|pruefe|analysiere|übernimm|uebernimm|"
+    r"arbeite|sorge)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+# In Fragerunden stehen die Auswahloptionen regelmäßig nach der Frage. Eine
+# echte Frage muss daher nicht die letzte Zeile sein, braucht aber ein
+# erkennbares Fragewort oder eine typische Verb-Erststellung. Ein beliebiges
+# Fragezeichen in einem Zitat, Dateinamen oder Statusbericht genügt nicht.
+DIRECT_QUESTION = re.compile(
+    r"(?:^|[\n.!]\s*)"
+    r"(?:"
+    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|wo|wohin|woher|wann|"
+    r"wieviel|wie\s+viel|wie\s+lange)\b"
+    r"|(?:soll\w*|darf\w*|kann\w*|könn\w*|koenn\w*|möcht\w*|moecht\w*|"
+    r"will\w*|ist|sind|hat|haben|braucht|passt|gilt|geht|funktioniert|"
+    r"should|shall|can|could|would|do|does|is|are|has|have|what|which|"
+    r"how|why|where|when|who)\b"
+    r")"
+    r"[^?\n]{0,500}\?",
+    re.IGNORECASE | re.MULTILINE,
+)
+QUOTED_DIRECT_QUESTION_CONTEXT = re.compile(
+    r"\b(?:beantworte|entscheide|wähle|waehle|antworte)\b[^?\n]{0,120}"
+    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|wo|wann|"
+    r"soll\w*|darf\w*|kann\w*|möcht\w*|moecht\w*|will\w*|ist|sind)\b"
+    r"[^?\n]{0,300}\?",
+    re.IGNORECASE | re.MULTILINE,
+)
+USER_PROMISES_FUTURE_INPUT = re.compile(
+    r"(?:"
+    r"(?=.*\b(?:gleich|sobald|nachher|bald)\b)"
+    r"(?=.*\b(?:workflow|entwurf|bereich|text|datei|pfad|info(?:rmation)?|"
+    r"input|antwort)\b)"
+    r"(?=.*\b(?:schick\w*|send\w*|liefer\w*|bekomm\w*|reich\w*|geb\w*)\b)"
+    r"|(?=.*\b(?:lasse|lass)\b.{0,80}\b(?:testen|pr[üu]fen|gegenchecken)\b)"
+    r"(?=.*\b(?:melde\s+mich|gebe\s+bescheid|schicke\s+das\s+ergebnis)\b)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+DIALOGUE_RESOLUTION_MARKERS = re.compile(
+    r"\b(?:fragerunde|entscheidung(?:en)?|punkte?)\b.{0,100}\b"
+    r"(?:abgeschlossen|gekl[äa]rt|beantwortet|zur\s+(?:getrennten\s+)?"
+    r"umsetzung\s+bereit)\b|\bkeine\s+weitere\s+frage\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def dialogue_round_active(transcript_path):
+    """Liest die jüngste taskgebundene Fragerunden-Anweisung der Session.
+
+    Kurze Antworten wie "vier Stunden" oder "weiter" beenden den Modus nicht.
+    Eine ausdrückliche Gegenanweisung oder ein erkennbar neuer Arbeitsauftrag
+    hebt ihn auf. Damit kann eine alte Fragerunde keine spätere Task blockieren.
+    """
+    active = False
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    not _is_real_user_message(entry)
+                    or _is_automatic_user_message(entry)
+                ):
+                    continue
+                user_text = _user_message_text(entry)
+                if DIALOGUE_ROUND_DISABLE.search(user_text):
+                    active = False
+                elif active and DIALOGUE_TASK_RESET.search(user_text):
+                    active = False
+                elif DIALOGUE_ROUND_ENABLE.search(user_text):
+                    active = True
+    except OSError:
+        return False
+    return active
+
+
+def asks_direct_question(text):
+    raw = str(text or "")
+    if QUOTED_DIRECT_QUESTION_CONTEXT.search(raw):
+        return True
+    without_examples = QUOTED_EXAMPLES.sub("", raw)
+    return DIRECT_QUESTION.search(without_examples) is not None
+
+
+def user_promises_future_input(text):
+    return USER_PROMISES_FUTURE_INPUT.search(str(text or "")) is not None
+
+
+def dialogue_round_resolved(text):
+    return DIALOGUE_RESOLUTION_MARKERS.search(str(text or "")) is not None
 
 # Eigenmächtiges Abbrechen oder Vertagen ist nur zusammen mit einem bereits
 # belegten Arbeitslauf ein Fortsetzungssignal. Dadurch bleiben reine
@@ -159,25 +319,44 @@ WORK_PROMISE_MARKERS = re.compile(
     # Muster Verb + beliebiges Mittelfeld + Vorsilbe erfasst statt einzelner
     # Formulierungen. Verneinungen im Mittelfeld schließen den Treffer aus.
     r"|ich (?:mache|arbeite|gehe|fahre|setze|bringe|ziehe|hole|f[üu]hre"
-    r"|schlie[ßs]e)\s"
+    r"|schlie[ßs]e|warte|starte|baue|r[äa]ume)\s"
     r"(?:(?!\bnicht\b|\bkein)[^\n]){0,80}"
-    r"\b(?:weiter|fort|fertig|ab(?!\s+und\s+zu\b)|durch|zu ende)\b"
+    r"\b(?:weiter|fort|fertig|ab(?!\s+und\s+zu\b)|durch|zu ende|neu|auf|weg)\b"
+    r"|\b(?:mach|mache)\s+ich(?:\s+(?:jetzt|gleich|sofort|direkt|nun))?(?:[.!]|\s*$|\s*,\s*ich\b)"
+    r"|\b(?:wird|werde ich)\s+(?:jetzt|gleich|sofort|direkt|nun)\s+(?:gemacht|erledigt|umgesetzt)\b"
+    r"|\bich\s+(?:muss|werde|sollte)\s+(?:das|es|die\s+aufgabe|den\s+punkt|nun|jetzt|noch|gleich|direkt|sofort)?\s*[^\n.!?]{0,80}\b"
+    r"(?:abschlie[ßs]en|umsetzen|machen|beheben|reparieren|l[öo]sen|fixen|anpassen|pr[üu]fen|testen|fertigstellen|erledigen|einrichten|starten|bereinigen|bauen)\b"
+    r"|\bich\s+(?:schlie[ßs]e|passe|richte|erg[äa]nze|[üu]bernehme|starte|baue|ziehe|gleiche|r[äa]ume|binde|beseitige|behebe|korrigiere|optimiere|verifiziere|exportiere|bereinige|aktualisiere|migriere|installiere)\s+"
+    r"(?:(?!\bnicht\b|\bkein)[^\n.!?]){0,60}\b"
+    r"(?:jetzt|nun|gleich|direkt|sofort|noch|neu|ab|an|ein|aus|weg|auf|dorthin|heran|separat|um)\b"
     # Vorangestelltes Objekt kehrt die Wortstellung um ("Das prüfe ich").
     # Verneinungen sind ausgenommen — "das mache ich nicht" ist eine Absage,
     # kein Fortsetzungsversprechen.
     r"|(?:^|[.!?;:]\s|\n|—\s|,\s)"
     r"(?:das|die|den|dies|dieses|solange|danach|anschlie[ßs]end|zuerst|erst|dann)"
     r"\b[^\n.!?]{0,60}\b"
-    r"(?:mache|pr[üu]fe|teste|baue|erledige|repariere|kl[äa]re|schaue|arbeite|hole)"
+    r"(?:mache|pr[üu]fe|teste|baue|erledige|repariere|kl[äa]re|schaue|arbeite|hole|[üu]bernehme|starte|schlie[ßs]e|fixe)"
     r"\s+ich\b(?!\s*(?:nicht|nie|ungern|kaum))"
-    r"|ich (?:repariere|behebe|korrigiere|ersetze|wiederhole|pr[üu]fe|teste) "
-    r"(?:zuerst|jetzt|gleich|direkt|nun|als n[äa]chstes)"
+    r"|ich (?:repariere|behebe|korrigiere|ersetze|wiederhole|pr[üu]fe|teste|baue|starte|[üu]bernehme|erg[äa]nze|schlie[ßs]e) "
+    r"(?:zuerst|jetzt|gleich|direkt|nun|als n[äa]chstes|danach|noch)"
     r"|ich (beginne|starte|fange|lege) (jetzt|gleich|nun|direkt|sofort)"
     r"|ich setze .{0,40}fort"
     r"|ich k[üu]mmere mich (jetzt|gleich|sofort|darum|dann)"
-    r"|(i'?ll|i will|let me) (check|take a (quick )?look|look into|get started"
-    r"|continue|proceed|now))",
+    r"|(?:i'\''?ll|i will|let me|i am going to|i need to)\s+"
+    r"(?:check|take a (?:quick )?look|look into|get started|continue|proceed|now|finish|complete|fix|update|implement|resolve|verify))",
     re.IGNORECASE,
+)
+
+# Unbegründete Rückfragen an den Nutzer statt selbstständiger Abarbeitung.
+UNWARRANTED_QUESTION_MARKERS = re.compile(
+    r"(?:\b(?:soll|sollen)\s+(?:ich|wir|die|das)\b[^\n?]{0,250}\?"
+    r"|\bm[öo]chtest\s+du\b[^\n?]{0,250}\?"
+    r"|\bwillst\s+du\b[^\n?]{0,250}\?"
+    r"|\bwie\s+m[öo]chtest\s+du\s+(?:vorgehen|das\s+haben|weitermachen)\b"
+    r"|\b(?:sag|gib|schreib)\s+(?:mir\s+)?(?:kurz\s+)?bescheid\b"
+    r"|\blass\s+mich\s+wissen\b"
+    r"|\b(?:should\s+i|shall\s+we|would\s+you\s+like\s+me\s+to)\b[^\n?]{0,250}\?)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Ein konkreter lokaler Restpunkt darf nicht durch einen externen Blocker
@@ -252,13 +431,19 @@ def has_work_promise(text):
     return WORK_PROMISE_MARKERS.search(without_examples) is not None
 
 
+def has_unwarranted_question(text):
+    without_examples = QUOTED_EXAMPLES.sub("", text)
+    return UNWARRANTED_QUESTION_MARKERS.search(without_examples) is not None
+
+
 def has_local_unfinished_marker(text):
     without_examples = QUOTED_EXAMPLES.sub("", text)
     return LOCAL_UNFINISHED_MARKERS.search(without_examples) is not None
 
 
 BLOCKED_ATTESTATION_LINE = re.compile(
-    r"(?:^|\n)\s*BLOCKED_ON_USER:\s*(?P<detail>[^\n]*)", re.IGNORECASE
+    r"(?:^|\n)\s*(?:[-*•]\s*)?BLOCKED_ON_USER:\s*(?P<detail>[^\n]*)",
+    re.IGNORECASE,
 )
 NON_SPECIFIC_BLOCKERS = re.compile(
     r"^(?:sp[aä]ter|unbekannt|unklar|offen|todo|tbd|n/?a|keine ahnung|wartet)"
@@ -274,12 +459,137 @@ BLOCKER_EVIDENCE = re.compile(
     r"\b(?:fehl(?:t|en|end\w*)|ben[öo]tig\w*|brauch(?:e|t|en)|muss|erforderlich|nur (?:nick|der nutzer|"
     r"die nutzerin)|nicht erreichbar|nicht verf[üu]gbar|abgelehnt|gesperrt|"
     r"timeout|error|fehler|http\s*[45]\d\d|enodata|eacces|permission|"
-    r"physisch\w*|registriert\w*|installier\w*|bedien\w*|freigabe|entscheidung|"
-    r"eingabe|antwort|zugang|w[aä]hl\w*|best[aä]tig\w*|bereitstell\w*|"
+    r"physisch\w*|registriert\w*|installier\w*|bedien\w*|\w*freigab\w*|entscheid\w*|"
+    r"eingabe|antwort|zugang|anmeld\w*|login|2fa|passwort|w[aä]hl\w*|"
+    r"best[aä]tig\w*|bereitstell\w*|"
+    r"liefer\w*|zuleit\w*|entwurf\w*|"
     r"schl[üu]ssel|key|eas_status_(?:finished|failed)|"
     r"is_for_ios_simulator_false|(?:idevice_tool|usbmuxd_socket|usb_device_bus)_missing)\b",
     re.IGNORECASE,
 )
+TAILSCALE_PC_CONNECTION_QUESTION = re.compile(
+    r"(?=.*\b(?:pc|rechner|computer)\b)"
+    r"(?=.*\b(?:tailscale|tailnet)\b)"
+    r"(?=.*\b(?:verbunden|verbindung|online|erreichbar)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Ein Kontaktagent darf einen ausdrücklichen Bildprüfauftrag nicht an Nick
+# zurückgeben, nur weil sein aktuell gepinntes Modell keine Bildeingaben
+# versteht. Die eigene Modellgrenze löst stattdessen eine taskgebundene
+# multimodale Routerübergabe aus. Metafragen zur Modellfähigkeit bleiben
+# davon unberührt.
+IMAGE_TASK_PROMPT = re.compile(
+    r"(?=.*\b(?:bild\w*|foto\w*|screenshot\w*|grafik\w*|image\w*|video\w*)\b)"
+    r"(?=.*\b(?:siehst?|sehen|ansehen|schau\w*|guck\w*|pr[üu]f\w*|"
+    r"analys\w*|beschreib\w*|erkenn\w*|bewert\w*)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+IMAGE_CAPABILITY_META_PROMPT = re.compile(
+    r"(?=.*\bmodell\w*\b)(?=.*\b(?:unterst[üu]tz\w*|f[äa]hig\w*|"
+    r"capabilit\w*|kann\s+(?:das\s+)?modell)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+IMAGE_CAPABILITY_DEFLECTION = re.compile(
+    r"(?:\b(?:kann|konnte)\b.{0,100}\bbild\w*\b.{0,100}\bnicht\b"
+    r".{0,60}\b(?:ansehen|sehen|pr[üu]fen|analysieren|auswerten|verarbeiten)\b"
+    r"|\bmodell\w*\b.{0,120}\bunterst[üu]tzt\b.{0,60}\bkeine?\b"
+    r".{0,40}\bbild(?:er|[- ]?eingaben?)?\b)"
+    r"(?=.*\b(?:multimodal\w*|router\w*|bild[- ]?eingab\w*|vision\w*)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def needs_multimodal_handoff(user_text, assistant_text):
+    concrete_router_rejection = re.search(
+        r"\b(?:herdr-?router|routerplan|router plan)\b.{0,160}"
+        r"\b(?:parked|geparkt|abgelehnt|executiongate)\b",
+        assistant_text or "", re.IGNORECASE | re.DOTALL,
+    )
+    return bool(
+        IMAGE_TASK_PROMPT.search(user_text or "")
+        and not IMAGE_CAPABILITY_META_PROMPT.search(user_text or "")
+        and not concrete_router_rejection
+        and (
+            IMAGE_CAPABILITY_DEFLECTION.search(assistant_text or "")
+            or re.search(
+                r"\b(?:agy|multimodal\w*|fachroute|bildroute|videoroute)\b"
+                r".{0,120}\b(?:nicht bereit|nicht verf[üu]gbar|fehlt|kann nicht)\b",
+                assistant_text or "", re.IGNORECASE | re.DOTALL,
+            )
+        )
+    )
+
+
+def needs_integration_configuration_preflight(assistant_text):
+    text = assistant_text or ""
+    claim = re.search(
+        r"\b(?:integration|verbindung|api)\b.{0,160}"
+        r"\b(?:nicht konfiguriert|unkonfiguriert|nicht nutzbar|fehlt|fehlen)\b",
+        text, re.IGNORECASE | re.DOTALL,
+    )
+    if not claim:
+        return False
+    effective = re.search(
+        r"\b(?:effektivcheck|laufzeitpfad|runtime)\b.{0,180}"
+        r"\b(?:configured|authorized|usable|false|fehlermeldung|error)\b",
+        text, re.IGNORECASE | re.DOTALL,
+    )
+    return not bool(effective)
+
+
+def needs_durable_bug_media_bundle(user_text, assistant_text, has_media=None):
+    request = re.search(r"\b(?:bug|fehler)\b", user_text or "", re.IGNORECASE)
+    if has_media is None:
+        has_media = bool(re.search(
+            r"\b(?:video\w*|screenshot\w*|bild\w*|foto\w*)\b",
+            user_text or "", re.IGNORECASE,
+        ))
+    media = has_media
+    if not (request and media):
+        return False
+    evidence = assistant_text or ""
+    required = [
+        r"\bbug[- ]?id\b",
+        r"\bkanonisch\w*\b.{0,40}\bprojekt",
+        r"\bsha-?256\b.{0,8}[a-f0-9]{64}\b",
+        r"\bmime\b.{0,20}\b(?:image|video)/",
+        r"\b(?:syncthing|sync)\b.{0,80}\b(?:bytegleich|ansichtskopie)\b",
+    ]
+    return not all(re.search(pattern, evidence, re.IGNORECASE | re.DOTALL) for pattern in required)
+
+
+def needs_audit_sync_evidence(assistant_text):
+    text = assistant_text or ""
+    finished = re.search(
+        r"\b(?:audit|architekturbericht|reviewbericht)\w*\b.{0,100}"
+        r"\b(?:fertig|fertiggestellt|abgeschlossen|aktualisiert)\b",
+        text, re.IGNORECASE | re.DOTALL,
+    )
+    if not finished:
+        return False
+    return not (
+        re.search(r"\bkanonisch\w*\b", text, re.IGNORECASE)
+        and re.search(r"\b(?:syncthing|sync)\b.{0,80}\b(?:bytegleich|ansichtskopie)\b", text, re.IGNORECASE | re.DOTALL)
+        and re.search(r"\bsha-?256\b.{0,8}[a-f0-9]{64}\b", text, re.IGNORECASE)
+    )
+
+
+def needs_complete_visual_acceptance(user_text, assistant_text):
+    if not IMAGE_TASK_PROMPT.search(user_text or ""):
+        return False
+    text = assistant_text or ""
+    if not re.search(r"\b(?:visuell\w*\s+pass|freigegeben|sieht .{0,20}gut)\b", text, re.IGNORECASE):
+        return False
+    dimensions = [
+        r"safe area|statusleiste", r"marke|logo|lesbarkeit",
+        r"[üu]berlagerung|clipping", r"navigation|footer",
+        r"eingabe|control", r"stil|icon",
+    ]
+    return not (
+        all(re.search(pattern, text, re.IGNORECASE) for pattern in dimensions)
+        and re.search(r"\bsha-?256\b.{0,8}[a-f0-9]{64}\b", text, re.IGNORECASE)
+    )
 
 EXPLICIT_RELEASE_AUTHORIZATION = re.compile(
     r"(?=.*\b(?:ota|eas[- ]?update|preview[- ]?update|deploy(?:ment|en)?|"
@@ -323,6 +633,7 @@ def blocked_on_user_detail(text):
         len(detail) < 12
         or NON_SPECIFIC_BLOCKERS.fullmatch(detail)
         or WEAK_BLOCKER_PHRASES.search(detail)
+        or TAILSCALE_PC_CONNECTION_QUESTION.search(detail)
         or not BLOCKER_EVIDENCE.search(detail)
     ):
         return None
@@ -409,6 +720,31 @@ def waits_for_external_eas_build(text):
     )
 
 
+ASSISTANT_TEXT_TYPES = ("text", "output_text")
+
+
+def _assistant_message_content(entry):
+    """Liefert die Content-Liste einer Assistant-Nachricht aus altem
+    (entry.type == "assistant") oder neuem Codex-Format
+    (entry.type == "response_item" mit payload message assistant).
+
+    Codex 0.147 serialisiert sichtbaren Assistenten-Text als output_text und
+    nicht mehr als text. Ohne diese Fallunterscheidung blieb die letzte
+    Assistenten-Antwort für Codex-Transkripte immer leer, wodurch alle
+    textbasierten Restarbeitsregeln des Guards nicht mehr griffen.
+    """
+    if entry.get("type") == "assistant":
+        return (entry.get("message") or {}).get("content") or []
+    payload = entry.get("payload") or {}
+    if (
+        entry.get("type") == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("role") == "assistant"
+    ):
+        return payload.get("content") or []
+    return []
+
+
 def last_assistant_text(transcript_path):
     text = None
     try:
@@ -421,19 +757,56 @@ def last_assistant_text(transcript_path):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if entry.get("type") != "assistant":
+                content = _assistant_message_content(entry)
+                if not content:
                     continue
-                content = (entry.get("message") or {}).get("content") or []
-                parts = [
-                    c.get("text", "")
-                    for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                ]
+                if isinstance(content, str):
+                    parts = [content]
+                else:
+                    parts = [
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") in ASSISTANT_TEXT_TYPES
+                    ]
                 if parts:
                     text = "\n".join(parts)
     except OSError:
         return None
     return text
+
+
+def turn_assistant_text(transcript_path):
+    """Liefert den gesamten sichtbaren Assistenten-Text des aktuellen Nutzerturns."""
+    messages = []
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
+                    messages.clear()
+                    continue
+                content = _assistant_message_content(entry)
+                if not content:
+                    continue
+                if isinstance(content, str):
+                    messages.append(content)
+                else:
+                    parts = [
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") in ASSISTANT_TEXT_TYPES
+                    ]
+                    if parts:
+                        messages.append("\n".join(parts))
+    except OSError:
+        return ""
+    return "\n".join(messages)
 
 
 def _is_real_user_message(entry):
@@ -480,6 +853,21 @@ def _is_stop_hook_prompt(entry):
     return _user_message_text(entry).lstrip().lower().startswith("<hook_prompt")
 
 
+def _is_codex_internal_context(entry):
+    """Erkennt von Codex injizierte Goal-/Laufzeitkontexte.
+
+    Diese Einträge werden technisch als User-Nachricht serialisiert, sind aber
+    weder eine neue Antwort von Nick noch eine neue Dialogrunde.
+    """
+    return _user_message_text(entry).lstrip().lower().startswith(
+        "<codex_internal_context"
+    )
+
+
+def _is_automatic_user_message(entry):
+    return _is_stop_hook_prompt(entry) or _is_codex_internal_context(entry)
+
+
 def last_actual_user_text(transcript_path):
     """Letzter echter Prompt, ohne vom Stop-Hook injizierte Fortsetzung."""
     latest = ""
@@ -493,11 +881,54 @@ def last_actual_user_text(transcript_path):
                 if not _is_real_user_message(entry):
                     continue
                 candidate = _user_message_text(entry)
-                if not candidate or _is_stop_hook_prompt(entry):
+                if not candidate or _is_automatic_user_message(entry):
                     continue
                 latest = candidate
     except OSError:
         return ""
+    return latest
+
+
+def _user_message_has_media(entry):
+    """Erkennt echte Medienblöcke, nicht bloße Wörter wie „Video“."""
+    message = (
+        entry.get("payload") or {}
+        if entry.get("type") == "response_item"
+        else entry.get("message") or {}
+    )
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "").lower()
+        mime = str(item.get("mime_type") or item.get("mimeType") or "").lower()
+        if kind in (
+            "input_image", "input_video", "image", "video", "attachment",
+        ) or mime.startswith(("image/", "video/")):
+            return True
+    return False
+
+
+def last_actual_user_has_media(transcript_path):
+    """Medienstatus ausschließlich des jüngsten echten Nutzerturns."""
+    latest = False
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    not _is_real_user_message(entry)
+                    or _is_automatic_user_message(entry)
+                ):
+                    continue
+                latest = _user_message_has_media(entry)
+    except OSError:
+        return False
     return latest
 
 
@@ -542,7 +973,10 @@ def turn_has_tool_activity(transcript_path):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
                     has_tool_activity = False
                     continue
                 if _is_tool_activity(entry):
@@ -550,6 +984,22 @@ def turn_has_tool_activity(transcript_path):
     except OSError:
         return False
     return has_tool_activity
+
+
+def session_has_tool_activity(transcript_path):
+    """Prüft, ob in der bisherigen Session überhaupt Werkzeugaktivität stattfand."""
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if _is_tool_activity(entry):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def continuation_has_tool_activity(transcript_path):
@@ -572,6 +1022,8 @@ def continuation_has_tool_activity(transcript_path):
                     if _is_stop_hook_prompt(entry):
                         hook_prompt_seen = True
                         has_tool_activity = False
+                    elif _is_codex_internal_context(entry):
+                        continue
                     else:
                         hook_prompt_seen = False
                         has_tool_activity = False
@@ -620,7 +1072,10 @@ def codex_open_exec_cells(transcript_path):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
                     open_cells.clear()
                     wait_calls.clear()
                     continue
@@ -684,14 +1139,43 @@ def _plan_items_from_input(raw):
     return items
 
 
-def codex_open_plan_items(transcript_path):
-    """Liest den jüngsten Codex-update_plan-Stand aus dem Transkript.
+def _requirement_key(step):
+    """Stabile, inhaltsbasierte ID fuer einen Planpunkt.
 
-    Codex speichert update_plan aktuell als JavaScript in einem exec-Toolcall.
-    Der Plan bleibt über Nutzerturns hinweg gültig, bis ein neuer update_plan-
-    Aufruf ihn ersetzt.
+    Die ID bleibt ueber replace-all-update_plan-Aufrufe stabil. Eine spaetere
+    Wiedereroeffnung erhaelt zusaetzlich eine neue Generation im Ledger.
     """
-    latest = []
+    normalized = re.sub(r"\s+", " ", str(step or "").strip().casefold())
+    return "req-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _plan_call_succeeded(payload):
+    if payload.get("is_error") is True or payload.get("isError") is True:
+        return False
+    status = str(payload.get("status") or "").lower()
+    if status in ("error", "failed", "rejected"):
+        return False
+    output = _payload_text(payload).strip().lower()
+    return not (
+        output.startswith("error:")
+        or '"iserror":true' in output.replace(" ", "")
+        or '"is_error":true' in output.replace(" ", "")
+    )
+
+
+def codex_requirement_ledger(transcript_path):
+    """Reduziert erfolgreiche Planereignisse zum aktuellen Plan-Snapshot.
+
+    update_plan ist eine Replace-all-Schnittstelle. Deshalb ersetzt jeder
+    erfolgreiche Aufruf den vorherigen Snapshot vollständig; ausgelassene,
+    erledigte oder verworfene Zwischenpunkte dürfen nicht als Phantomarbeit
+    fortleben. Toolcalls mit call_id werden erst nach einem erfolgreichen
+    korrelierten Toolresultat übernommen. Alte Transkripte ohne call_id bleiben
+    rückwärtskompatibel auswertbar. Requirement-IDs und Generationen bleiben
+    für Punkte stabil, die im aktuellen Snapshot tatsächlich wiederkehren.
+    """
+    events = []
+    pending_calls = {}
     try:
         with open(transcript_path, encoding="utf-8") as f:
             for line in f:
@@ -702,35 +1186,143 @@ def codex_open_plan_items(transcript_path):
                 if entry.get("type") != "response_item":
                     continue
                 payload = entry.get("payload") or {}
-                if payload.get("type") not in ("custom_tool_call", "function_call"):
-                    continue
-                raw = payload.get("input") or payload.get("arguments") or ""
-                if not isinstance(raw, str):
-                    raw = json.dumps(raw, ensure_ascii=False)
-                name = str(payload.get("name") or "").lower()
-                if not (
-                    "update_plan" in name
-                    or "tools.update_plan" in raw
-                    or "functions.update_plan" in raw
-                ):
-                    continue
-                # Tests und Wartung des Guards enthalten absichtlich
-                # update_plan-Fixtures, sind aber kein Arbeitsplan der Session.
-                if any(
-                    token in raw
-                    for token in (
+                kind = payload.get("type")
+                if kind in ("custom_tool_call", "function_call"):
+                    raw = payload.get("input") or payload.get("arguments") or ""
+                    if not isinstance(raw, str):
+                        raw = json.dumps(raw, ensure_ascii=False)
+                    name = str(payload.get("name") or "").lower()
+                    if not (
+                        "update_plan" in name
+                        or "tools.update_plan" in raw
+                        or "functions.update_plan" in raw
+                    ):
+                        continue
+                    if any(token in raw for token in (
                         "agent-stop-guard/",
                         "stop-open-items-guard.py",
                         "test_stop_open_items_guard.py",
-                    )
-                ):
-                    continue
-                parsed = _plan_items_from_input(raw)
-                if parsed:
-                    latest = parsed
+                    )):
+                        continue
+                    parsed = _plan_items_from_input(raw)
+                    if not parsed:
+                        continue
+                    call_id = payload.get("call_id")
+                    if call_id:
+                        pending_calls[call_id] = parsed
+                    else:
+                        events.append((parsed, ["legacy-transcript-plan-call"]))
+                elif kind in ("custom_tool_call_output", "function_call_output"):
+                    call_id = payload.get("call_id")
+                    parsed = pending_calls.pop(call_id, None)
+                    if parsed is not None and _plan_call_succeeded(payload):
+                        events.append((parsed, [f"tool-result:{call_id}"]))
     except OSError:
         return []
-    return [item for item in latest if item["status"] in ("pending", "in_progress")]
+
+    ledger = {}
+    generations = {}
+    previous_status = {}
+    for event_index, (items, evidence_refs) in enumerate(events, start=1):
+        next_ledger = {}
+        for item in items:
+            requirement_id = _requirement_key(item["step"])
+            current = ledger.get(requirement_id)
+            status = item["status"]
+            generation = generations.get(requirement_id, 0)
+            if generation == 0:
+                generation = generations.get(requirement_id, 0) + 1
+                generations[requirement_id] = generation
+            elif (
+                status in ("pending", "in_progress")
+                and previous_status.get(requirement_id) in ("completed", "superseded")
+            ):
+                generation += 1
+                generations[requirement_id] = generation
+            next_ledger[requirement_id] = {
+                "id": requirement_id,
+                "generation": generation,
+                "step": item["step"],
+                "status": status,
+                "lastEvent": event_index,
+                "evidenceRefs": list(evidence_refs),
+            }
+            previous_status[requirement_id] = status
+        for superseded_id in set(ledger) - set(next_ledger):
+            previous_status[superseded_id] = "superseded"
+        ledger = next_ledger
+
+    return sorted(ledger.values(), key=lambda item: (item["lastEvent"], item["id"]))
+
+
+def codex_open_plan_items(transcript_path):
+    """Liefert alle offenen Requirements der aktuellen Ledger-Generation."""
+    return [
+        {"step": item["step"], "status": item["status"]}
+        for item in codex_requirement_ledger(transcript_path)
+        if item["status"] in ("pending", "in_progress")
+    ]
+
+
+def codex_plan_updated_in_current_turn(transcript_path):
+    """Belegt einen erfolgreichen update_plan-Aufruf seit Nicks letztem Prompt.
+
+    Ein Codex-Plan ist eine turnlokale Arbeitsanzeige, kein dauerhaftes Goal.
+    Deshalb darf ein Plan aus einem früheren Nutzerturn den Abschluss eines
+    späteren, engeren Auftrags nicht blockieren. Automatische Hook- und
+    interne Kontextnachrichten beginnen dagegen keinen neuen Nutzerturn.
+    """
+    pending_calls = {}
+    successful_update = False
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
+                    pending_calls = {}
+                    successful_update = False
+                    continue
+                if entry.get("type") != "response_item":
+                    continue
+                payload = entry.get("payload") or {}
+                kind = payload.get("type")
+                if kind in ("custom_tool_call", "function_call"):
+                    raw = payload.get("input") or payload.get("arguments") or ""
+                    if not isinstance(raw, str):
+                        raw = json.dumps(raw, ensure_ascii=False)
+                    name = str(payload.get("name") or "").lower()
+                    if not (
+                        "update_plan" in name
+                        or "tools.update_plan" in raw
+                        or "functions.update_plan" in raw
+                    ):
+                        continue
+                    if any(token in raw for token in (
+                        "agent-stop-guard/",
+                        "stop-open-items-guard.py",
+                        "test_stop_open_items_guard.py",
+                    )):
+                        continue
+                    if not _plan_items_from_input(raw):
+                        continue
+                    call_id = payload.get("call_id")
+                    if call_id:
+                        pending_calls[call_id] = True
+                    else:
+                        successful_update = True
+                elif kind in ("custom_tool_call_output", "function_call_output"):
+                    call_id = payload.get("call_id")
+                    if pending_calls.pop(call_id, None) and _plan_call_succeeded(payload):
+                        successful_update = True
+    except OSError:
+        return False
+    return successful_update
 
 
 def task_blocked_on_user(task):
@@ -747,6 +1339,74 @@ def plan_item_blocked_on_user(item):
         item.get("status") == "pending"
         and blocked_on_user_detail(str(item.get("step") or "")) is not None
     )
+
+
+PERIODIC_MONITOR_STEP = re.compile(
+    r"(?=.*\b(?:alle\s+\d+\s*(?:sekunden|minuten|stunden)|periodisch|"
+    r"fortlaufend|kontinuierlich|laufend)\b)"
+    r"(?=.*\b(?:monitor\w*|[üu]berwach\w*|\w*kapazit[äa]t\w*|status)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+PERIODIC_LOCAL_WORK = re.compile(
+    r"\b(?:reparier\w*|implementier\w*|integrier\w*|baue?\w*|"
+    r"fertigstell\w*|weiter\s+reparier\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def plan_item_is_periodic_monitor(item):
+    step = str(item.get("step") or "")
+    return bool(
+        item.get("status") in ("pending", "in_progress")
+        and PERIODIC_MONITOR_STEP.search(step)
+        and not PERIODIC_LOCAL_WORK.search(step)
+    )
+
+
+def active_durable_monitors():
+    """Liefert nur eng registrierte, noch laufende Nutzerprozesse.
+
+    Die optionale Registry ist reine Evidenz; der Hook startet selbst keine
+    Prozesse. Ein Eintrag gilt nur mit gleicher UID, lebender PID und einem
+    tatsächlich in der Prozess-Commandline gebundenen, vertrauenswürdigen Pfad.
+    """
+    registry = os.path.join(STATE_ROOT, "durable-monitors.json")
+    try:
+        with open(registry, encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    trusted_roots = tuple(os.path.realpath(path) + os.sep for path in (
+        os.path.expanduser("~/.local/share/herdr-router"),
+        os.path.expanduser("~/.local/bin"),
+    ))
+    active = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        pid = entry.get("pid")
+        declared_path = entry.get("path")
+        if not isinstance(pid, int) or pid <= 1 or not isinstance(declared_path, str):
+            continue
+        real_path = os.path.realpath(declared_path)
+        if not any(real_path.startswith(root) for root in trusted_roots):
+            continue
+        proc_root = f"/proc/{pid}"
+        try:
+            if os.stat(proc_root).st_uid != os.getuid():
+                continue
+            with open(os.path.join(proc_root, "cmdline"), "rb") as f:
+                command = f.read(16 * 1024).replace(b"\x00", b" ").decode(
+                    "utf-8", errors="replace"
+                )
+        except OSError:
+            continue
+        if real_path not in command:
+            continue
+        active.append({"pid": pid, "path": real_path})
+    return active
 
 
 UNICODE_HYPHENS = str.maketrans({
@@ -839,7 +1499,10 @@ def mobile_ui_frame_state(transcript_path, assistant_text=""):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry) and not _is_stop_hook_prompt(entry):
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
                     has_tool_activity = False
                     platform_signal = False
                     visual_signal = False
@@ -961,7 +1624,10 @@ def last_assistant_phase(transcript_path):
                     entry = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if _is_real_user_message(entry):
+                if (
+                    _is_real_user_message(entry)
+                    and not _is_automatic_user_message(entry)
+                ):
                     phase = None
                     continue
                 if entry.get("type") == "response_item":
@@ -1076,11 +1742,32 @@ def followthrough_pending(session_id):
     return os.path.exists(followthrough_pending_path(session_id))
 
 
-def set_followthrough_pending(session_id):
+def followthrough_pending_kind(session_id):
+    try:
+        with open(followthrough_pending_path(session_id), encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        # Rückwärtskompatibilität für alte Dateien, die nur einen Zeitstempel
+        # enthielten: Sie entstanden aus harten Fortsetzungsfällen.
+        return "hard"
+    kind = parsed.get("kind") if isinstance(parsed, dict) else None
+    return kind if kind in ("soft", "hard") else "hard"
+
+
+def set_followthrough_pending(session_id, kind="hard"):
+    if kind not in ("soft", "hard"):
+        raise ValueError("Follow-through-Art muss soft oder hard sein")
     try:
         ensure_state_root()
         with open(followthrough_pending_path(session_id), "w", encoding="utf-8") as f:
-            f.write(datetime.datetime.now().isoformat(timespec="seconds"))
+            json.dump({
+                "kind": kind,
+                "createdAt": datetime.datetime.now().isoformat(timespec="seconds"),
+            }, f, sort_keys=True)
     except OSError:
         pass
 
@@ -1195,12 +1882,6 @@ def main():
     if os.path.exists(KILL_SWITCH):
         log(session_id, "aus", f"Notausgang {KILL_SWITCH} aktiv")
         return
-    if (
-        payload.get("hook_event_name") == "Stop"
-        and payload.get("stop_hook_active") is False
-    ):
-        clear_block_counters(session_id)
-
     # Codex liefert die letzte Antwort direkt mit; Claude Code nur den Transcript-Pfad
     text = payload.get("last_assistant_message")
     if not text:
@@ -1211,7 +1892,22 @@ def main():
 
     transcript_path = payload.get("transcript_path")
     last_user_text = last_actual_user_text(transcript_path) if transcript_path else ""
+    current_turn_text = turn_assistant_text(transcript_path) if transcript_path else text
+    dialogue_text = "\n".join(
+        part for part in (current_turn_text, text) if part
+    )
+    # Der letzte echte Nutzerprompt bleibt während aller automatisch
+    # injizierten Stop-Fortsetzungen stabil. Er ist deshalb der verlässliche
+    # Turn-Schlüssel, selbst wenn ein Provider jeden Retry fälschlich erneut
+    # mit stop_hook_active=false kennzeichnet.
+    turn_fingerprint = hashlib.sha256(
+        last_user_text.encode("utf-8")
+    ).hexdigest()
     blocked_attested = has_blocked_attestation(text)
+    dialogue_round = bool(
+        transcript_path and dialogue_round_active(transcript_path)
+    )
+    question_wait = bool(asks_direct_question(dialogue_text))
 
     # Eine Commentary-Nachricht ist per Definition ein Zwischenstand. Codex
     # darf einen Turn niemals dort beenden, unabhängig davon, welche Verben die
@@ -1231,7 +1927,7 @@ def main():
             "Turn endete auf Commentary-Phase",
             3,
             kind="commentary",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
 
@@ -1283,11 +1979,11 @@ def main():
             "Release-Freigabe durch unbelegte Sitzungsgrenze zurückgewiesen",
             8,
             kind="release-deflection",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
 
-    if has_blocker_attestation_line(text) and not blocked_attested:
+    if has_blocker_attestation_line(text) and not blocked_attested and not dialogue_round:
         reason = (
             "UNGÜLTIGER NUTZERBLOCKER: Die Abschlusszeile BLOCKED_ON_USER ist "
             "leer, vage, optional oder nicht durch einen konkret benötigten "
@@ -1302,9 +1998,44 @@ def main():
             "formal vorhandener, aber unbelegter BLOCKED_ON_USER",
             8,
             kind="invalid-blocker",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
+
+    if (
+        not blocked_attested
+        and needs_multimodal_handoff(last_user_text, text)
+    ):
+        reason = (
+            "MULTIMODALE ÜBERGABE ERFORDERLICH: Nick hat einen konkreten "
+            "Bildauftrag gestellt und deine Antwort bestätigt, dass nur das "
+            "aktuell gepinnte Modell keine Bildeingaben unterstützt. Das ist "
+            "kein Nutzerblocker. Behalte den Nutzerkontakt, lies das aktuelle "
+            "Router-Schema und delegiere den unveränderten Bildauftrag "
+            "taskgebunden mit der passenden Bild- oder Screenshot-Modalität "
+            "an ein freigegebenes multimodales Modell. Frage Nick nur dann "
+            "erneut, wenn ein realer Provider-, Daten-, Sandbox- oder "
+            "Berechtigungsfehler die sichere Übergabe konkret verhindert."
+        )
+        if block(
+            session_id,
+            reason,
+            "Bildauftrag wegen eigener Modellgrenze zurückgegeben",
+            1,
+            kind="multimodal-handoff",
+            fingerprint=turn_fingerprint,
+        ):
+            return
+
+    # Eine echte, aktuelle Frage wartet auf Nick. Sie darf weder durch eine
+    # ältere Task-/Plananzeige noch durch Textheuristiken in eine künstliche
+    # Fortsetzungsschleife umgedeutet werden. Ein laufender Prozess bleibt
+    # davon unberührt; der Hook beendet oder bereinigt ihn nicht.
+    if question_wait:
+        clear_audit_pending(session_id)
+        clear_followthrough_pending(session_id)
+        log(session_id, "durchgelassen", "aktuelle Frage wartet auf Nutzerantwort")
+        return
 
     # 1. Harte Regel: offene Tasks. Zählt unabhängig vom Antworttext und
     #    bekommt ein großes Budget - solange Arbeit offen ist, wird gearbeitet.
@@ -1336,7 +2067,7 @@ def main():
             session_id,
             reason,
             f"{len(actionable_tasks)} offene Tasks",
-            25,
+            MAX_STRUCTURED_BLOCKS,
             kind="tasks",
             fingerprint=hashlib.sha256(
                 json.dumps(actionable_tasks, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1348,9 +2079,19 @@ def main():
     # update_plan-Aufruf ist deshalb das harte strukturierte Signal. Ohne
     # diese Prüfung kann ein lokaler in_progress-Punkt neben einem externen
     # API-Blocker fälschlich als vollständig blockiert erscheinen.
-    plan_pending = codex_open_plan_items(transcript_path) if transcript_path else []
+    plan_pending = (
+        codex_open_plan_items(transcript_path)
+        if transcript_path and codex_plan_updated_in_current_turn(transcript_path)
+        else []
+    )
+    durable_monitors = active_durable_monitors()
+    monitored_plan = [
+        item for item in plan_pending
+        if plan_item_is_periodic_monitor(item) and durable_monitors
+    ]
     actionable_plan = [
-        item for item in plan_pending if not plan_item_blocked_on_user(item)
+        item for item in plan_pending
+        if not plan_item_blocked_on_user(item) and item not in monitored_plan
     ]
     parked_plan = [item for item in plan_pending if plan_item_blocked_on_user(item)]
     if actionable_plan:
@@ -1376,7 +2117,7 @@ def main():
             session_id,
             reason,
             f"{len(actionable_plan)} offene Codex-Planpunkte",
-            25,
+            MAX_STRUCTURED_BLOCKS,
             kind="plans",
             fingerprint=hashlib.sha256(
                 json.dumps(actionable_plan, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1384,24 +2125,67 @@ def main():
         ):
             return
 
-    if (parked_tasks or parked_plan) and not blocked_attested:
-        reason = (
-            "BLOCKER-BESTÄTIGUNG FEHLT: Strukturierte Tasks beziehungsweise "
-            "Planpunkte sind mit 'BLOCKED_ON_USER:' geparkt. Beende den Turn "
-            "erst nach Abarbeitung aller unabhängigen Punkte und nenne dann "
-            "den konkret benötigten Nutzerinput mit rohem Beleg in einer "
-            "eigenen Abschlusszeile 'BLOCKED_ON_USER: ...'."
+    # Ein lokal korrekt strukturierter BLOCKED_ON_USER-Planpunkt ist selbst
+    # der maßgebliche Nachweis. Eine zusätzliche, sichtbare Abschlusszeile
+    # würde nur erneut formale Marker erzwingen und widerspräche dem
+    # dialogischen Abschlussmodell. Ungültige Abschlusszeilen werden weiter
+    # oberhalb separat zurückgewiesen.
+
+    evidence_gap = None
+    if needs_integration_configuration_preflight(text):
+        evidence_gap = (
+            "INTEGRATIONSSTATUS NICHT BELEGT: Prüfe vor einer Blockade den "
+            "kanonischen Laufzeitpfad sekretfrei auf configured, authorized "
+            "und usable; ein fehlender Wert im Worktree genügt nicht."
         )
+    elif needs_durable_bug_media_bundle(
+        last_user_text,
+        text,
+        has_media=(
+            last_actual_user_has_media(transcript_path)
+            if transcript_path else False
+        ),
+    ):
+        evidence_gap = (
+            "BUG-MEDIENBELEG FEHLT: Binde den Anhang an Bug-ID, kanonische "
+            "Projektablage, SHA-256, MIME-Typ und bytegleiche Sync-Ansicht."
+        )
+    elif needs_audit_sync_evidence(text):
+        evidence_gap = (
+            "AUDIT-SYNCBELEG FEHLT: Nenne kanonische Quelle, bytegleiche "
+            "Syncthing-Ansichtskopie und identische SHA-256."
+        )
+    elif needs_complete_visual_acceptance(last_user_text, text):
+        evidence_gap = (
+            "VISUELLE ABNAHME UNVOLLSTÄNDIG: Ein PASS benötigt getrennte "
+            "Belege für Safe Area, Marke/Lesbarkeit, Überlagerung, Navigation, "
+            "Controls, Stil/Iconkonsistenz und die Bild-SHA-256."
+        )
+    if evidence_gap:
         if block(
             session_id,
-            reason,
-            "geparkter Blocker ohne Abschlusszeile",
+            evidence_gap,
+            "fehlender kanonischer Abschlussbeleg",
             3,
-            kind="blocker-attestation",
-            fingerprint=hashlib.sha256(
-                json.dumps(parked_tasks + parked_plan, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest(),
+            kind="evidence-contract",
+            fingerprint=turn_fingerprint,
         ):
+            return
+
+    # Eine Fragerunde ist nur Kontext für zulässiges Warten, niemals selbst ein
+    # Stop-Grund. Insbesondere erzwingt der Guard keine künstliche nächste
+    # Frage. Harte Tasks, Pläne und offene Werkzeug-Cells wurden oberhalb
+    # bereits vollständig geprüft; die normalen Restarbeitsregeln bleiben
+    # unterhalb aktiv.
+    if dialogue_round:
+        if user_promises_future_input(last_user_text) or dialogue_round_resolved(dialogue_text):
+            clear_audit_pending(session_id)
+            clear_followthrough_pending(session_id)
+            log(
+                session_id,
+                "durchgelassen",
+                "Fragerunde wartet auf Nutzerantwort oder angekündigten Input",
+            )
             return
 
     # 2. Harte Restarbeitsregel: Wenn eine Arbeitssession selbst einraeumt,
@@ -1411,29 +2195,47 @@ def main():
     #    Fortsetzung oder einen belegten Nutzerblocker ausloesen.
     completion_check = bool(COMPLETION_CHECK_PROMPT.search(last_user_text))
     read_only_scope = bool(READ_ONLY_SCOPE_PROMPT.search(last_user_text))
-    admitted_current_rest = bool(
-        text
-        and (
-            has_current_scope_incomplete_marker(text)
-            or has_execution_deferral_marker(text)
-            or (completion_check and has_open_status_marker(text))
-        )
-    )
+    turn_text = current_turn_text or text
+    # Textsignale bewerten grundsätzlich nur den aktuellen Abschluss. Der
+    # gesamte Turn enthält regelmäßig frühere, anschließend erfüllte
+    # Ankündigungen wie "Ich prüfe das jetzt". Würden sie erneut ausgewertet,
+    # vergifteten sie jeden späteren faktischen Fertigbericht und erzeugten
+    # Stop-Schleifen. Der Turntext ist nur ein Fallback für Provider, die keine
+    # letzte Assistentennachricht liefern. Strukturierte Tasks, Pläne und
+    # Werkzeugzustände werden unabhängig davon weiterhin separat geprüft.
+    evaluated_text = text or turn_text
+
     active_execution_scope = bool(
-        transcript_path
-        and not read_only_scope
+        not read_only_scope
         and (
-            turn_has_tool_activity(transcript_path)
+            (
+                transcript_path
+                and (
+                    turn_has_tool_activity(transcript_path)
+                    or session_has_tool_activity(transcript_path)
+                )
+            )
             or payload.get("stop_hook_active") is True
+            or USER_EXECUTION_REQUEST.search(last_user_text or "")
         )
     )
+
+    admitted_current_rest = bool(
+        evaluated_text
+        and (
+            has_current_scope_incomplete_marker(evaluated_text)
+            or has_execution_deferral_marker(evaluated_text)
+            or (completion_check and has_open_status_marker(evaluated_text))
+        )
+    )
+
     if (
         admitted_current_rest
         and not blocked_attested
         and ((completion_check and not read_only_scope) or active_execution_scope)
     ):
         set_audit_pending(session_id)
-        set_followthrough_pending(session_id)
+        set_followthrough_pending(session_id, kind="hard")
         reason = (
             "STOPP VERWEIGERT: Deine eigene Abschlussantwort sagt, dass der "
             "aktuell besprochene Arbeitsumfang noch nicht fertig ist. Ein "
@@ -1452,23 +2254,32 @@ def main():
             "selbst eingeraeumte Restarbeit im aktuellen Umfang",
             25,
             kind="unfinished-status",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
 
     # 3. Weiche Textregel mit Scope-Schutz. Reine Befunde, Empfehlungen,
     # Optionen und spätere Ausbauschritte sind kein Umsetzungsauftrag. Geblockt
-    # werden nur eigene unmittelbare Arbeitsversprechen, ein konkreter lokaler
-    # Rest neben BLOCKED_ON_USER oder ein Widerspruch zur Vollständigkeitszeile.
+    # werden nur eigene unmittelbare Arbeitsversprechen, unbegründete Rückfragen,
+    # ein konkreter lokaler Rest neben BLOCKED_ON_USER oder ein Widerspruch zur
+    # Vollständigkeitszeile.
+    unwarranted_question = bool(
+        has_unwarranted_question(text)
+        and not blocked_attested
+        and not read_only_scope
+        and active_execution_scope
+    )
     text_requires_continuation = bool(
-        text
+        evaluated_text
+        and not read_only_scope
         and (
-            has_work_promise(text)
-            or (blocked_attested and has_local_unfinished_marker(text))
+            has_work_promise(evaluated_text)
+            or (blocked_attested and has_local_unfinished_marker(evaluated_text))
             or (
                 has_full_completion_attestation(text)
                 and has_open_status_marker(text)
             )
+            or unwarranted_question
         )
     )
     if text_requires_continuation:
@@ -1478,28 +2289,60 @@ def main():
         # offener Punkte durchrutschen, weil die erste Rückgabe den regulären
         # Abschlussaudit darunter noch nicht erreicht hat.
         set_audit_pending(session_id)
-        set_followthrough_pending(session_id)
-        reason = (
-            "Deine letzte Antwort enthält ein eigenes unmittelbares "
-            "Arbeitsversprechen oder widerspricht ihrer strukturierten "
-            "Abschlusszeile. Prüfe ausschließlich den ORIGINALAUFTRAG und führe "
-            "nur darin bereits beauftragte Restarbeit aus. Der Hook erweitert "
-            "den Nutzerauftrag und deine Schreibberechtigung ausdrücklich nicht: "
-            "Empfehlungen, Optionen, Auditbefunde, mögliche spätere Schritte "
-            "und nicht beauftragte Verbesserungen dürfen nicht allein wegen "
-            "dieser Meldung umgesetzt werden. War nur Analyse oder Beratung "
-            "beauftragt, korrigiere den Abschlussbericht statt Dateien oder "
-            "Systemzustand zu verändern."
-        )
-        if block(session_id, reason, "Ankündigungsmuster im Text", MAX_BLOCKS):
+        set_followthrough_pending(session_id, kind="soft")
+        if unwarranted_question:
+            reason = (
+                "RÜCKFRAGE OHNE BLOCKER: Du fragst nach Erlaubnis oder Vorgehen, "
+                "statt beauftragte Aufgaben selbstständig abzuarbeiten. Führe den "
+                "Originalauftrag JETZT weiter. Stoppe nur mit einer formalen "
+                "Zeile 'BLOCKED_ON_USER: <konkreter Input und Beleg>', wenn wirklich "
+                "eine unumgängliche Entscheidung oder ein externer Blocker vorliegt."
+            )
+            block_detail = "Unbegründete Rückfrage statt Fortsetzung"
+        else:
+            reason = (
+                "Deine letzte Antwort enthält ein eigenes unmittelbares "
+                "Arbeitsversprechen oder widerspricht ihrer strukturierten "
+                "Abschlusszeile. Prüfe ausschließlich den ORIGINALAUFTRAG und führe "
+                "nur darin bereits beauftragte Restarbeit aus. Der Hook erweitert "
+                "den Nutzerauftrag und deine Schreibberechtigung ausdrücklich nicht: "
+                "Empfehlungen, Optionen, Auditbefunde, mögliche spätere Schritte "
+                "und nicht beauftragte Verbesserungen dürfen nicht allein wegen "
+                "dieser Meldung umgesetzt werden. War nur Analyse oder Beratung "
+                "beauftragt, korrigiere den Abschlussbericht statt Dateien oder "
+                "Systemzustand zu verändern."
+            )
+            block_detail = "Ankündigungsmuster im Text"
+        if block(
+            session_id,
+            reason,
+            block_detail,
+            MAX_BLOCKS,
+            fingerprint=turn_fingerprint,
+        ):
             return
 
     # Ein bereits blockierter Abschluss darf nicht mit einer sprachlich
     # saubereren Ausrede im automatischen Fortsetzungsturn durchrutschen. Nach
     # einer Restarbeits- oder Versprechensblockade muss die Session tatsächlich
     # weiterarbeiten oder einen konkreten Nutzerblocker belegen.
+    pending_followthrough_kind = followthrough_pending_kind(session_id)
     if (
-        followthrough_pending(session_id)
+        pending_followthrough_kind == "soft"
+        and payload.get("stop_hook_active") is True
+        and not text_requires_continuation
+    ):
+        clear_audit_pending(session_id)
+        clear_followthrough_pending(session_id)
+        log(
+            session_id,
+            "durchgelassen",
+            "unveränderter weicher Fehlalarm nach einer Korrektur fail-open",
+        )
+        return
+
+    if (
+        pending_followthrough_kind == "hard"
         and payload.get("stop_hook_active") is True
         and not blocked_attested
         and not (
@@ -1523,7 +2366,7 @@ def main():
             "Stop-Fortsetzung ohne neue Werkzeugaktivität",
             8,
             kind="follow-through",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
 
@@ -1567,7 +2410,7 @@ def main():
             "Mobile-UI ohne Vollrahmen-Nachweis",
             3,
             kind="iphone-frame",
-            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            fingerprint=turn_fingerprint,
         ):
             return
 

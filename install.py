@@ -106,8 +106,22 @@ def copy_file(source: Path, target: Path, mode: int, *, dry_run: bool) -> None:
     if dry_run:
         return
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    shutil.copyfile(source, target)
-    os.chmod(target, mode)
+    with source.open("rb") as reader, tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        delete=False,
+    ) as handle:
+        shutil.copyfileobj(reader, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temp_path = Path(handle.name)
+    try:
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, target)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def install(
