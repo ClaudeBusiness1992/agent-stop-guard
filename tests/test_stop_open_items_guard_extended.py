@@ -2,6 +2,7 @@
 """Regressionstests fuer die Textsignale des Stop-Guards."""
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -1746,6 +1747,83 @@ class ToolActivityTests(unittest.TestCase):
             "stop_hook_active": False,
         })
         self.assertEqual(json.loads(output)["decision"], "block")
+
+    def test_reine_betriebsstatusfrage_erzeugt_keine_fortsetzung(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Geht es jetzt?"}],
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+        ])
+        output = self.run_guard({
+            "hook_event_name": "Stop",
+            "session_id": "unit-runtime-status-only",
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Noch nicht vollständig: Der Router ist aktiv, aber "
+                "herdr-runtime ist weiterhin gestoppt."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(output, "")
+
+    def test_alte_harte_fortsetzung_gilt_nicht_fuer_neuen_nutzerprompt(self):
+        session_id = "unit-followthrough-new-user-turn"
+        old_fingerprint = hashlib.sha256(
+            "Repariere den Router vollständig.".encode("utf-8")
+        ).hexdigest()
+        GUARD.set_followthrough_pending(
+            session_id,
+            kind="hard",
+            turn_fingerprint=old_fingerprint,
+        )
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": (
+                    "Wir arbeiten künftig ohne herdr-runtime. Nimm den "
+                    "Stop-Hook-Punkt bitte nur auf."
+                )}],
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": (
+                    '<hook_prompt hook_run_id="stop:9">Arbeite weiter.</hook_prompt>'
+                )}],
+            }},
+        ])
+        output = self.run_guard({
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Der Stop-Hook-Befund ist aufgenommen; die spätere "
+                "Nachbesserung ist nicht Teil dieses Statusauftrags."
+            ),
+            "stop_hook_active": True,
+        })
+        self.assertEqual(output, "")
+        self.assertFalse(GUARD.followthrough_pending(session_id))
+
+    def test_womit_frage_wartet_auf_nutzerentscheidung(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "weiter"}],
+            }},
+        ])
+        output = self.run_guard({
+            "hook_event_name": "Stop",
+            "session_id": "unit-womit-question",
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Womit soll ich fortfahren? A: Stop-Hook committen. "
+                "B: Router ohne Runtime planen."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(output, "")
 
     def test_hook_fortsetzung_mit_unveraenderter_restarbeit_blockiert_erneut(self):
         path = self.write_transcript([

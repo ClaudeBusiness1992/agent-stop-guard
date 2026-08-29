@@ -152,6 +152,27 @@ USER_EXECUTION_REQUEST = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Kurze Betriebs- und Versionsfragen prüfen nur den aktuellen Zustand. Sie
+# erteilen weder eine Startfreigabe noch reaktivieren sie zuvor pausierte
+# Arbeit. Strukturierte aktuelle Tasks/Pläne und offene Werkzeugläufe werden
+# weiterhin unabhängig davon geprüft.
+STATUS_OBSERVATION_PROMPT = re.compile(
+    r"(?:\b(?:geht|l[äa]uft|funktioniert|klappt)\s+(?:es|das)\s+jetzt\b"
+    r"|\b(?:welche|was\s+f[üu]r\s+eine|ist\s+die)\s+version\b"
+    r"|\b(?:router|runtime|dienst|container|server)\b.{0,60}"
+    r"\b(?:aktiv|gestartet|gestoppt|online|offline|erreichbar|version|status)\b"
+    r"|\b(?:status|stand)\s+(?:von|des|der)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def user_requests_status_observation(text):
+    raw = str(text or "")
+    return bool(
+        STATUS_OBSERVATION_PROMPT.search(raw)
+        and not USER_EXECUTION_REQUEST.search(raw)
+    )
+
 # Eine ausdrücklich gewünschte Fragerunde ist ein dialogischer Auftrag: Der
 # Agent erklärt genau einen Punkt, stellt genau eine Frage und wartet dann auf
 # die Antwort. Ein Stop an dieser Stelle ist kein Abbruch offener Arbeit.
@@ -202,7 +223,8 @@ DIALOGUE_TASK_RESET = re.compile(
 DIRECT_QUESTION = re.compile(
     r"(?:^|[\n.!]\s*)"
     r"(?:"
-    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|wo|wohin|woher|wann|"
+    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|"
+    r"wo(?:mit|bei|zu|f[üu]r|gegen|durch|von|rauf|r[üu]ber|hin|her)?|wann|"
     r"wieviel|wie\s+viel|wie\s+lange)\b"
     r"|(?:soll\w*|darf\w*|kann\w*|könn\w*|koenn\w*|möcht\w*|moecht\w*|"
     r"will\w*|ist|sind|hat|haben|braucht|passt|gilt|geht|funktioniert|"
@@ -214,7 +236,8 @@ DIRECT_QUESTION = re.compile(
 )
 QUOTED_DIRECT_QUESTION_CONTEXT = re.compile(
     r"\b(?:beantworte|entscheide|wähle|waehle|antworte)\b[^?\n]{0,120}"
-    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|wo|wann|"
+    r"(?:was|wer|wen|wem|welch\w*|wie|warum|weshalb|"
+    r"wo(?:mit|bei|zu|f[üu]r|gegen|durch|von|rauf|r[üu]ber|hin|her)?|wann|"
     r"soll\w*|darf\w*|kann\w*|möcht\w*|moecht\w*|will\w*|ist|sind)\b"
     r"[^?\n]{0,300}\?",
     re.IGNORECASE | re.MULTILINE,
@@ -1742,7 +1765,7 @@ def followthrough_pending(session_id):
     return os.path.exists(followthrough_pending_path(session_id))
 
 
-def followthrough_pending_kind(session_id):
+def followthrough_pending_state(session_id):
     try:
         with open(followthrough_pending_path(session_id), encoding="utf-8") as f:
             value = f.read().strip()
@@ -1752,13 +1775,23 @@ def followthrough_pending_kind(session_id):
         parsed = json.loads(value)
     except json.JSONDecodeError:
         # Rückwärtskompatibilität für alte Dateien, die nur einen Zeitstempel
-        # enthielten: Sie entstanden aus harten Fortsetzungsfällen.
-        return "hard"
-    kind = parsed.get("kind") if isinstance(parsed, dict) else None
-    return kind if kind in ("soft", "hard") else "hard"
+        # enthielten: Nach dem Upgrade werden sie fail-open verworfen.
+        return {"kind": "hard", "turnFingerprint": None}
+    if not isinstance(parsed, dict):
+        return {"kind": "hard", "turnFingerprint": None}
+    kind = parsed.get("kind")
+    return {
+        "kind": kind if kind in ("soft", "hard") else "hard",
+        "turnFingerprint": parsed.get("turnFingerprint"),
+    }
 
 
-def set_followthrough_pending(session_id, kind="hard"):
+def followthrough_pending_kind(session_id):
+    state = followthrough_pending_state(session_id)
+    return state.get("kind") if state else None
+
+
+def set_followthrough_pending(session_id, kind="hard", turn_fingerprint=None):
     if kind not in ("soft", "hard"):
         raise ValueError("Follow-through-Art muss soft oder hard sein")
     try:
@@ -1767,6 +1800,7 @@ def set_followthrough_pending(session_id, kind="hard"):
             json.dump({
                 "kind": kind,
                 "createdAt": datetime.datetime.now().isoformat(timespec="seconds"),
+                "turnFingerprint": turn_fingerprint,
             }, f, sort_keys=True)
     except OSError:
         pass
@@ -2194,7 +2228,10 @@ def main():
     #    Kontrollfrage "alle Aufgaben erledigt?": Ein ehrliches "Nein" muss
     #    Fortsetzung oder einen belegten Nutzerblocker ausloesen.
     completion_check = bool(COMPLETION_CHECK_PROMPT.search(last_user_text))
-    read_only_scope = bool(READ_ONLY_SCOPE_PROMPT.search(last_user_text))
+    read_only_scope = bool(
+        READ_ONLY_SCOPE_PROMPT.search(last_user_text)
+        or user_requests_status_observation(last_user_text)
+    )
     turn_text = current_turn_text or text
     # Textsignale bewerten grundsätzlich nur den aktuellen Abschluss. Der
     # gesamte Turn enthält regelmäßig frühere, anschließend erfüllte
@@ -2235,7 +2272,11 @@ def main():
         and ((completion_check and not read_only_scope) or active_execution_scope)
     ):
         set_audit_pending(session_id)
-        set_followthrough_pending(session_id, kind="hard")
+        set_followthrough_pending(
+            session_id,
+            kind="hard",
+            turn_fingerprint=turn_fingerprint,
+        )
         reason = (
             "STOPP VERWEIGERT: Deine eigene Abschlussantwort sagt, dass der "
             "aktuell besprochene Arbeitsumfang noch nicht fertig ist. Ein "
@@ -2289,7 +2330,11 @@ def main():
         # offener Punkte durchrutschen, weil die erste Rückgabe den regulären
         # Abschlussaudit darunter noch nicht erreicht hat.
         set_audit_pending(session_id)
-        set_followthrough_pending(session_id, kind="soft")
+        set_followthrough_pending(
+            session_id,
+            kind="soft",
+            turn_fingerprint=turn_fingerprint,
+        )
         if unwarranted_question:
             reason = (
                 "RÜCKFRAGE OHNE BLOCKER: Du fragst nach Erlaubnis oder Vorgehen, "
@@ -2326,7 +2371,26 @@ def main():
     # saubereren Ausrede im automatischen Fortsetzungsturn durchrutschen. Nach
     # einer Restarbeits- oder Versprechensblockade muss die Session tatsächlich
     # weiterarbeiten oder einen konkreten Nutzerblocker belegen.
-    pending_followthrough_kind = followthrough_pending_kind(session_id)
+    pending_followthrough_state = followthrough_pending_state(session_id)
+    pending_followthrough_kind = (
+        pending_followthrough_state.get("kind")
+        if pending_followthrough_state else None
+    )
+    pending_turn_fingerprint = (
+        pending_followthrough_state.get("turnFingerprint")
+        if pending_followthrough_state else None
+    )
+    # Eine Fortsetzungssperre gehört exakt zu dem Nutzerturn, der sie erzeugt
+    # hat. Ein neuer echter Nutzerprompt darf niemals zur künstlichen
+    # Fortsetzung eines alten Auftrags gezwungen werden. Alte Zustandsdateien
+    # ohne Fingerprint werden nach diesem Upgrade ebenfalls fail-open verworfen.
+    if (
+        pending_followthrough_kind
+        and pending_turn_fingerprint != turn_fingerprint
+    ):
+        clear_audit_pending(session_id)
+        clear_followthrough_pending(session_id)
+        pending_followthrough_kind = None
     if (
         pending_followthrough_kind == "soft"
         and payload.get("stop_hook_active") is True
