@@ -258,6 +258,28 @@ class ToolActivityTests(unittest.TestCase):
         ])
         self.assertTrue(GUARD.turn_has_tool_activity(path))
 
+    def test_zweiter_hook_prompt_loescht_fortsetzungsarbeit_nicht(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Repariere den Fehler."}],
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": (
+                    '<hook_prompt hook_run_id="stop:1">Arbeite weiter.</hook_prompt>'
+                )}],
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": (
+                    '<hook_prompt hook_run_id="stop:2">Arbeite weiter.</hook_prompt>'
+                )}],
+            }},
+        ])
+        self.assertTrue(GUARD.continuation_has_tool_activity(path))
+
     def test_claude_arbeits_turn_wird_erkannt(self):
         path = self.write_transcript([
             {"type": "user", "message": {"role": "user", "content": "Baue das fertig"}},
@@ -2017,6 +2039,37 @@ class ToolActivityTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertFalse(GUARD.audit_pending(session_id))
 
+    def test_externes_routergate_parkt_abhaengige_planpunkte_ohne_schleife(self):
+        path = self.write_transcript([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": (
+                    "Erstelle die Terat-iOS-Vorschau und lasse sie durch Sol prüfen."
+                )}],
+            }},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec",
+                "input": (
+                    'tools.update_plan({"plan":['
+                    '{"step":"Sol High prüft das Agy-Ergebnis","status":"pending"},'
+                    '{"step":"Reviewbefunde integrieren","status":"pending"}]})'
+                ),
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+        ])
+        output = self.run_guard({
+            "hook_event_name": "Stop",
+            "session_id": "unit-external-router-gate-plan",
+            "transcript_path": path,
+            "last_assistant_message": (
+                "Die Vorschau ist technisch vollständig geprüft. Der gewünschte "
+                "Sol-High-Review konnte wegen dreifacher Ressourcen-Deferral des "
+                "Routers nicht starten und ist noch nicht fachlich abgenommen."
+            ),
+            "stop_hook_active": False,
+        })
+        self.assertEqual(output, "")
+
     def test_entscheidung_im_codex_plan_ist_ein_nutzerblocker(self):
         item = {
             "step": (
@@ -2164,6 +2217,33 @@ class ToolActivityTests(unittest.TestCase):
             GUARD.has_completion_attestation(
                 "BLOCKED_ON_USER: Nick muss die gewünschte Zielfarbe auswählen."
             )
+        )
+        self.assertTrue(
+            GUARD.has_completion_attestation(
+                "BLOCKED_ON_USER: Der Agy-Supervisor parkt die vollständig "
+                "gebundene Route `gemini-3.7-flash-high / high` und fordert "
+                "fälschlich erneut Modell und Effort an."
+            )
+        )
+
+    def test_belegtes_externes_routergate_ist_terminal(self):
+        self.assertTrue(GUARD.has_terminal_external_runtime_gate(
+            "Der gewünschte Sol-High-Review konnte wegen dreifacher "
+            "Ressourcen-Deferral des Routers nicht starten; die Vorschau ist "
+            "technisch geprüft, aber noch nicht durch Sol fachlich abgenommen."
+        ))
+
+    def test_echte_auswahlfrage_am_routergate_ist_zulaessig(self):
+        text = (
+            "Agy ist durch einen konkreten Routerfehler blockiert: Die Planung "
+            "bestätigt Modell und Effort High, der Supervisor parkt den Lauf. "
+            "Soll ich den Routerfehler separat reparieren oder Agy durch einen "
+            "anderen Designer ersetzen?"
+        )
+        self.assertTrue(GUARD.has_material_choice_question(text))
+        self.assertFalse(
+            GUARD.has_unwarranted_question(text)
+            and not GUARD.has_material_choice_question(text)
         )
 
     def test_workerstart_ausrede_erfordert_echte_fortsetzungsarbeit(self):

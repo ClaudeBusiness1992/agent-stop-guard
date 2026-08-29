@@ -482,6 +482,7 @@ BLOCKER_EVIDENCE = re.compile(
     r"\b(?:fehl(?:t|en|end\w*)|ben[öo]tig\w*|brauch(?:e|t|en)|muss|erforderlich|nur (?:nick|der nutzer|"
     r"die nutzerin)|nicht erreichbar|nicht verf[üu]gbar|abgelehnt|gesperrt|"
     r"timeout|error|fehler|http\s*[45]\d\d|enodata|eacces|permission|"
+    r"geparkt|parkt|deferral|ressourcengate|supervisor|"
     r"physisch\w*|registriert\w*|installier\w*|bedien\w*|\w*freigab\w*|entscheid\w*|"
     r"eingabe|antwort|zugang|anmeld\w*|login|2fa|passwort|w[aä]hl\w*|"
     r"best[aä]tig\w*|bereitstell\w*|"
@@ -490,6 +491,39 @@ BLOCKER_EVIDENCE = re.compile(
     r"is_for_ios_simulator_false|(?:idevice_tool|usbmuxd_socket|usb_device_bus)_missing)\b",
     re.IGNORECASE,
 )
+
+# Ein konkret belegtes externes Laufzeitgate ist ein zulässiger terminaler
+# INCOMPLETE-Zustand. Der Guard darf daraus weder eine erfundene lokale
+# Reparaturfreigabe noch eine Endlosschleife machen. Die Erkennung bleibt eng:
+# Infrastruktur + Ablehnung/Deferral + konkreter Lauf- oder Messbeleg.
+EXTERNAL_RUNTIME_GATE = re.compile(
+    r"(?=.*\b(?:router|supervisor|provider|worker(?:[- ]?slice)?|cgroup|"
+    r"ressourcen?|speicher|swap|kontingent|capacity)\b)"
+    r"(?=.*\b(?:parkt|geparkt|abgelehnt|deferral|deferred|blockiert|"
+    r"scheitert|fehler|fordert\s+f[aä]lschlich|nicht\s+starten)\b)"
+    r"(?=.*(?:\b\d+(?:[.,]\d+)?\s*(?:bytes?|kib|mib|gib|%|versuche?)\b|"
+    r"\b(?:modell|effort|executiongate|high|low)\b|`[^`]+`))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def has_terminal_external_runtime_gate(text):
+    raw = str(text or "")
+    return bool(
+        EXTERNAL_RUNTIME_GATE.search(raw)
+        and not has_work_promise(raw)
+        and not has_local_unfinished_marker(raw)
+    )
+
+
+def has_material_choice_question(text):
+    """Erlaubt eine echte Auswahl bei einem belegten externen Gate."""
+    raw = str(text or "")
+    return bool(
+        asks_direct_question(raw)
+        and re.search(r"\boder\b", raw, re.IGNORECASE)
+        and EXTERNAL_RUNTIME_GATE.search(raw)
+    )
 TAILSCALE_PC_CONNECTION_QUESTION = re.compile(
     r"(?=.*\b(?:pc|rechner|computer)\b)"
     r"(?=.*\b(?:tailscale|tailnet)\b)"
@@ -1043,8 +1077,12 @@ def continuation_has_tool_activity(transcript_path):
                     continue
                 if _is_real_user_message(entry):
                     if _is_stop_hook_prompt(entry):
-                        hook_prompt_seen = True
-                        has_tool_activity = False
+                        # Mehrere automatisch injizierte Stop-Prompts gehören
+                        # zur selben Fortsetzung. Ein späterer Hook-Prompt darf
+                        # bereits geleistete Werkzeugaktivität nicht löschen.
+                        if not hook_prompt_seen:
+                            hook_prompt_seen = True
+                            has_tool_activity = False
                     elif _is_codex_internal_context(entry):
                         continue
                     else:
@@ -2076,7 +2114,7 @@ def main():
     pending = open_tasks(session_id)
     actionable_tasks = [task for task in pending if not task_blocked_on_user(task)]
     parked_tasks = [task for task in pending if task_blocked_on_user(task)]
-    if actionable_tasks:
+    if actionable_tasks and not has_terminal_external_runtime_gate(text):
         listing = "\n".join(
             f"- #{task.get('id')} [{task.get('status')}] {task.get('subject')}"
             for task in actionable_tasks[:12]
@@ -2128,7 +2166,7 @@ def main():
         if not plan_item_blocked_on_user(item) and item not in monitored_plan
     ]
     parked_plan = [item for item in plan_pending if plan_item_blocked_on_user(item)]
-    if actionable_plan:
+    if actionable_plan and not has_terminal_external_runtime_gate(text):
         listing = "\n".join(
             f"- [{item['status']}] {item['step']}" for item in actionable_plan[:12]
         )
@@ -2259,6 +2297,7 @@ def main():
 
     admitted_current_rest = bool(
         evaluated_text
+        and not has_terminal_external_runtime_gate(evaluated_text)
         and (
             has_current_scope_incomplete_marker(evaluated_text)
             or has_execution_deferral_marker(evaluated_text)
@@ -2306,6 +2345,7 @@ def main():
     # Vollständigkeitszeile.
     unwarranted_question = bool(
         has_unwarranted_question(text)
+        and not has_material_choice_question(text)
         and not blocked_attested
         and not read_only_scope
         and active_execution_scope
